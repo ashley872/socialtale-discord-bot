@@ -1,0 +1,30 @@
+{
+  "slackChannelId": "C0B1DRP9JP2",
+  "servers": [
+    {
+      "id": "1491691991933784114",
+      "name": "Neora",
+      "enabled": true,
+      "teamRole": null,
+      "teamUsernames": [
+        "socialtale.",
+        "emasocialtale_09942",
+        "stephf123_",
+        "nicole__kathleen"
+      ],
+      "responseTimeMinutes": 60,
+      "alertChannelName": "team-alerts",
+      "digestChannelName": "team-alerts",
+      "excludeChannels": [],
+      "excludeBots": true
+    }
+  ],
+  "defaults": {
+    "responseTimeMinutes": 60,
+    "alertChannelName": "team-alerts",
+    "digestChannelName": "team-alerts",
+    "excludeBots": true,
+    "digestTime": "09:00",
+    "metricsSnapshotTime": "23:55"
+  }
+}
