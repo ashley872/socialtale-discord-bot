@@ -16,6 +16,7 @@
 
 const { Client, GatewayIntentBits, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 const { WebClient } = require('@slack/web-api');
+const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { readFileSync } = require('fs');
 const path = require('path');
@@ -34,6 +35,17 @@ const RESPONSE_TIME_MINS = CONFIG.responseTimeMinutes || 60;
 const ALERT_CHANNEL_NAME = CONFIG.alertChannelName || 'team-alerts';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+// ── Brand Contexts (AI Auto-Reply) ──────────────────────────────────────────
+const BRAND_CONTEXTS = JSON.parse(readFileSync(path.join(__dirname, 'brand-contexts.json'), 'utf8'));
+const DEFAULT_BRAND = BRAND_CONTEXTS._default;
+const AUTO_REPLY_DELAY_MS = (DEFAULT_BRAND.autoReplyDelayMinutes || 15) * 60 * 1000;
+const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
+
+// Track auto-reply rate limiting: serverId → { count, resetTime }
+const autoReplyLimits = new Map();
+// Track pending auto-replies: messageId → timeoutId (so we can cancel if team replies first)
+const pendingAutoReplies = new Map();
 
 // ── Slack ───────────────────────────────────────────────────────────────────
 const slack = process.env.SLACK_BOT_TOKEN ? new WebClient(process.env.SLACK_BOT_TOKEN) : null;
@@ -439,6 +451,145 @@ async function postDailyDigest() {
   }
 }
 
+// ── AI Auto-Reply ───────────────────────────────────────────────────────────
+function getBrandContext(serverId) {
+  return { ...DEFAULT_BRAND, ...(BRAND_CONTEXTS[serverId] || {}) };
+}
+
+function isAutoReplyRateLimited(serverId) {
+  const limit = autoReplyLimits.get(serverId);
+  const maxPerHour = getBrandContext(serverId).maxRepliesPerHour || 10;
+  if (!limit || Date.now() > limit.resetTime) {
+    autoReplyLimits.set(serverId, { count: 0, resetTime: Date.now() + 3600000 });
+    return false;
+  }
+  return limit.count >= maxPerHour;
+}
+
+function incrementAutoReplyCount(serverId) {
+  const limit = autoReplyLimits.get(serverId);
+  if (limit) limit.count++;
+}
+
+async function generateAutoReply(message, brandCtx) {
+  if (!anthropic) return null;
+
+  const faqEntries = brandCtx.faq
+    ? Object.entries(brandCtx.faq).map(([q, a]) => `Q: ${q}\nA: ${a}`).join('\n\n')
+    : '';
+
+  const contextInfo = (brandCtx.context || []).join('\n');
+
+  const systemPrompt = `You are replying as ${brandCtx.brandName || 'the brand'} in a Discord community server for creators and affiliates.
+
+Brand voice: ${brandCtx.brandVoice || DEFAULT_BRAND.brandVoice}
+
+Brand context:
+${contextInfo}
+
+Known FAQ:
+${faqEntries}
+
+Rules:
+- Reply in 1-3 sentences max. Be helpful and concise.
+- Never say you're an AI, bot, or assistant. You ARE the brand team.
+- If the message is just chit-chat, a greeting, or doesn't need a response, reply with exactly: NO_REPLY
+- If you're not confident you can give an accurate, helpful answer, reply with exactly: NO_REPLY
+- Do not make up information. Only use what's in the brand context and FAQ above.
+- Match the casual, friendly tone of Discord. Use emojis naturally but sparingly.
+- If someone asks something not covered in FAQ/context, reply with: NO_REPLY`;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: `Discord message from ${message.author.displayName || message.author.username} in #${message.channel.name}:\n\n${message.content}` }],
+    });
+
+    const reply = response.content[0]?.text?.trim();
+    if (!reply || reply === 'NO_REPLY') return null;
+    return reply;
+  } catch (err) {
+    console.error('AI reply error:', err.message);
+    return null;
+  }
+}
+
+function scheduleAutoReply(message) {
+  const brandCtx = getBrandContext(message.guild.id);
+  if (!brandCtx.autoReplyEnabled) return;
+  if (!anthropic) return;
+
+  // Don't reply in excluded channels
+  const excludeChannels = brandCtx.excludeChannels || DEFAULT_BRAND.excludeChannels || [];
+  const channelName = message.channel.name.replace(/[^\w-]/g, ''); // strip emojis for matching
+  if (excludeChannels.some(ex => message.channel.name.includes(ex) || channelName.includes(ex))) return;
+
+  const delayMs = (brandCtx.autoReplyDelayMinutes || DEFAULT_BRAND.autoReplyDelayMinutes || 15) * 60 * 1000;
+
+  const timeoutId = setTimeout(async () => {
+    pendingAutoReplies.delete(message.id);
+
+    // Check if already answered by team
+    const serverPending = pendingMessages.get(message.guild.id);
+    if (!serverPending?.has(message.id)) return; // already answered
+
+    // Rate limit check
+    if (isAutoReplyRateLimited(message.guild.id)) return;
+
+    // Generate reply
+    const reply = await generateAutoReply(message, brandCtx);
+    if (!reply) return;
+
+    // Post via webhook (as brand) not as bot
+    const webhook = await getOrCreateWebhook(message.channel, brandCtx.brandName || message.guild.name);
+    if (webhook) {
+      await webhook.send({
+        content: reply,
+        username: brandCtx.brandName || message.guild.name,
+        avatarURL: message.guild.iconURL({ size: 128 }),
+      });
+    } else {
+      // Fallback: reply as bot
+      await message.reply(reply);
+    }
+
+    incrementAutoReplyCount(message.guild.id);
+
+    // Mark as answered
+    if (serverPending) serverPending.delete(message.id);
+    await supabase.from('discord_messages')
+      .update({
+        is_answered: true,
+        replied_at: new Date().toISOString(),
+        replied_by: 'auto-reply',
+        reply_time_seconds: Math.floor(delayMs / 1000),
+      })
+      .eq('discord_message_id', message.id)
+      .eq('discord_server_id', message.guild.id);
+
+    console.log(`Auto-replied in #${message.channel.name} (${message.guild.name}): ${reply.substring(0, 80)}...`);
+
+    // Notify Slack that bot auto-replied
+    await slackAlert(`Auto-replied in ${message.guild.name} Discord`, [
+      { type: 'section', text: { type: 'mrkdwn',
+        text: `*#${message.channel.name}* — ${message.author.username} asked:\n>${message.content.substring(0, 200)}\n\n*Bot replied:*\n${reply}` } },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: ':robot_face: Auto-reply after ' + (delayMs / 60000) + 'min — check if response is accurate' }] },
+    ]);
+  }, delayMs);
+
+  pendingAutoReplies.set(message.id, timeoutId);
+}
+
+function cancelAutoReply(messageId) {
+  const timeoutId = pendingAutoReplies.get(messageId);
+  if (timeoutId) {
+    clearTimeout(timeoutId);
+    pendingAutoReplies.delete(messageId);
+  }
+}
+
 // ── Event Handlers ──────────────────────────────────────────────────────────
 client.on('ready', async () => {
   const serverNames = client.guilds.cache.map(g => `${g.name} (${g.memberCount} members)`);
@@ -479,7 +630,21 @@ client.on('messageCreate', async (message) => {
   if (await handleStatusCommand(message)) return;
 
   await trackMessage(message, isTeam);
-  if (isTeam) await markAsAnswered(message);
+
+  if (isTeam) {
+    // Team replied — cancel any pending auto-replies in this channel
+    const serverPending = pendingMessages.get(message.guild.id);
+    if (serverPending) {
+      for (const [msgId, info] of serverPending.entries()) {
+        if (info.channelId === message.channel.id) cancelAutoReply(msgId);
+      }
+    }
+    if (message.reference?.messageId) cancelAutoReply(message.reference.messageId);
+    await markAsAnswered(message);
+  } else {
+    // Community message — schedule auto-reply after delay
+    scheduleAutoReply(message);
+  }
 });
 
 client.on('guildMemberAdd', (member) => {
