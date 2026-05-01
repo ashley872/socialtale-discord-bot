@@ -669,11 +669,12 @@ function scheduleAutoReply(message) {
     const reply = await generateAutoReply(message, brandCtx);
     if (!reply) return;
 
-    // Post via webhook (as brand) not as bot
+    // Post via webhook (as brand) not as bot, @ mention the user
+    const mention = `<@${message.author.id}>`;
     const webhook = await getOrCreateWebhook(message.channel, brandCtx.brandName || message.guild.name);
     if (webhook) {
       await webhook.send({
-        content: reply,
+        content: `${mention} ${reply}`,
         username: brandCtx.brandName || message.guild.name,
         avatarURL: message.guild.iconURL({ size: 128 }),
       });
