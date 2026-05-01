@@ -9,7 +9,7 @@
   },
   "1491691991933784114": {
     "brandName": "Neora",
-    "brandVoice": "Warm, encouraging, beauty-community tone. Like a supportive friend who knows the products inside out. Use emojis naturally but not excessively.",
+    "brandVoice": "Warm, encouraging, beauty-community tone. Like a supportive friend who knows the products inside out.",
     "context": [
       "Neora is a skincare and wellness brand selling on TikTok Shop.",
       "Products include Neo-FILLER Face & Lip Contour Duo, age-defying skincare, and wellness supplements.",
@@ -17,13 +17,148 @@
       "Current campaign: April Stock Up + Mother's Day — 20% OFF all products (April 22 – May 3)."
     ],
     "faq": {
-      "How do I get samples?": "Head to TikTok Shop > Affiliate > Product Marketplace. Search for the Neora product you want, then click 'Request Sample' if it's available. We approve requests regularly!",
+      "How do I get samples?": "Head to TikTok Shop > Affiliate > Product Marketplace. Search for the Neora product you want, then click 'Request Sample' if available. We approve requests regularly!",
       "Where do I find my Spark code?": "Go to your posted video > tap the three dots > scroll to Ad Settings > turn on Ad Authorisation > set the available period > save > tap 'Manage' next to Video Code > copy and send it to us!",
       "Are there any coupons or discounts?": "Check the #campaigns-incentives channel for the latest offers! We regularly run promotions and creator-exclusive deals.",
       "What commission do I earn?": "Commission rates are set per product on TikTok Shop. You can see the exact rate when you browse the product in the Affiliate Marketplace.",
       "When is the next live?": "Keep an eye on #announcements for live session schedules! We'll always give you a heads up beforehand.",
       "How do I join the affiliate program?": "You can find Neora products in the TikTok Shop Affiliate Marketplace. Just search for Neora, select a product, and click 'Promote' to generate your affiliate link.",
       "What content performs best?": "Authentic, personal reviews and before/after content tend to perform really well. Check #announcements for content inspiration we share regularly."
+    }
+  },
+  "1483078993875042385": {
+    "brandName": "Intelligent Change",
+    "brandVoice": "Uplifting, mindful, and positive. Think journaling community energy — calm, thoughtful, inspiring.",
+    "context": [
+      "Intelligent Change makes productivity and mindfulness journals, planners, and lifestyle products.",
+      "Products include The Five Minute Journal, Productivity Planner, and other self-improvement tools.",
+      "Creators promote via TikTok Shop affiliate links.",
+      "Samples are requested through TikTok Shop's affiliate sample request system."
+    ],
+    "faq": {
+      "How do I get samples?": "Go to TikTok Shop > Affiliate > Product Marketplace, search for Intelligent Change products, and click 'Request Sample'. We review and approve requests regularly — hang tight!",
+      "My sample request expired, what do I do?": "No worries! Just submit a new sample request through TikTok Shop. Requests do expire after a set period, so resubmit and we'll get to it.",
+      "When will samples be approved?": "We review sample requests regularly. Once approved, TikTok Shop will notify you and ship them out. Keep an eye on your TikTok notifications!",
+      "What campaigns are running right now?": "Check the #campaigns-incentives channel for all current promotions and creator challenges!",
+      "Where do I send my Spark code?": "Drop your Spark codes in the #spark-code channel. If you need help generating one, go to your video > three dots > Ad Settings > turn on Ad Authorisation > copy the video code.",
+      "What is an ETA on sample delivery?": "Shipping times vary but typically 5-10 business days after approval. If it's been longer, let us know in #samples!"
+    }
+  },
+  "1473326679072968889": {
+    "brandName": "Legendairy Milk",
+    "brandVoice": "Warm, supportive, mom-to-mom energy. Empathetic and encouraging — this is a community of moms supporting each other.",
+    "context": [
+      "Legendairy Milk makes lactation supplements, breastfeeding accessories, and mom wellness products.",
+      "Products include lactation supplements (Liquid Gold, Cash Cow, etc.), silicone milk cups, electrolytes, and nursing accessories.",
+      "Creators are mostly breastfeeding/postpartum moms promoting via TikTok Shop affiliate links.",
+      "Samples are requested through TikTok Shop's affiliate sample request system."
+    ],
+    "faq": {
+      "How do I get approved for samples?": "Submit your request through TikTok Shop > Affiliate > Product Marketplace. Search for Legendairy Milk, select the product, and click 'Request Sample'. We review requests regularly!",
+      "How long does sample approval take?": "We review sample requests on a regular basis. You'll get a notification from TikTok Shop once approved. If your request expired, just resubmit — no worries!",
+      "My sample request expired, what do I do?": "Totally normal! Requests expire after a set period. Just go back to the product in TikTok Shop and submit a new sample request. We'll review it!",
+      "How do I know if I'm approved?": "TikTok Shop will send you a notification when your sample is approved. You can also check your sample request status in the Affiliate section of TikTok Shop.",
+      "Will the silicone milk cups be restocked?": "Keep an eye on the TikTok Shop listing! Restocks happen regularly. We'll announce any big restocks in #announcements.",
+      "Can I get refundable samples?": "Yes! If free samples aren't available, you can purchase the product through TikTok Shop at the sale price. Some creators prefer this for faster access.",
+      "Where do I send my Spark code?": "Drop your Spark codes in the #spark-code channel!"
+    }
+  },
+  "1475506197615607990": {
+    "brandName": "Wellness Pet",
+    "brandVoice": "Fun, pet-loving energy. Think excited dog parent vibes — warm, playful, and genuine.",
+    "context": [
+      "Wellness Pet makes natural pet food, treats, and supplements for dogs and cats.",
+      "Creators are pet parents/pet content creators promoting via TikTok Shop affiliate links.",
+      "Samples are requested through TikTok Shop's affiliate sample request system."
+    ],
+    "faq": {
+      "How do I get samples?": "Head to TikTok Shop > Affiliate > Product Marketplace, search for Wellness Pet products, and click 'Request Sample'. We'll review your request!",
+      "Where do I send my Spark/ad code?": "Drop your Spark codes in the #spark-code channel! If you need help generating one, check the pinned instructions there.",
+      "What content performs best?": "Authentic pet content performs amazingly — your pet trying the food for the first time, taste tests, before/after coat condition, daily feeding routines. Just keep it real!",
+      "What products can I promote?": "Browse the full range in the TikTok Shop Affiliate Marketplace. We have dog food, cat food, treats, and supplements available."
+    }
+  },
+  "1478719552261984358": {
+    "brandName": "Epres",
+    "brandVoice": "Chic, beauty-savvy, and confident. Like chatting with a knowledgeable friend at a salon.",
+    "context": [
+      "Epres (épres) is a professional hair care brand known for bond repair treatments.",
+      "Products include the Bond Repair Treatment, shampoo, conditioner, and styling products.",
+      "Creators promote via TikTok Shop affiliate links.",
+      "Samples are requested through TikTok Shop's affiliate sample request system."
+    ],
+    "faq": {
+      "How do I get samples?": "Go to TikTok Shop > Affiliate > Product Marketplace, search for Epres, and click 'Request Sample'. We review requests regularly!",
+      "Where do I send my Spark code?": "Drop your Spark codes in the #spark-code channel!",
+      "What content works best?": "Before/after transformation content is huge for hair care. Show the difference the Bond Repair Treatment makes — real results resonate!",
+      "What products are available?": "Check the TikTok Shop Affiliate Marketplace for the full Epres range including Bond Repair Treatment, shampoo, and conditioner."
+    }
+  },
+  "1375469643938005073": {
+    "brandName": "Loop",
+    "brandVoice": "Cool, inclusive, and community-driven. Supportive of neurodivergent and sensory-conscious creators. Modern and relatable.",
+    "context": [
+      "Loop makes premium earplugs for noise reduction — designed for everyday life, concerts, focus, sleep, and sensory needs.",
+      "Product lines include Loop Quiet, Loop Experience, Loop Engage, Loop Switch, and Loop Engage 2 Kids.",
+      "Large creator community (1,100+ members) with VIP creator tier.",
+      "Creators promote via TikTok Shop affiliate links. Flash sales available for live streamers.",
+      "Loop runs regular creator challenges with cash payouts.",
+      "Samples are requested through TikTok Shop collab invites."
+    ],
+    "faq": {
+      "How do I get samples?": "You can request samples through TikTok Shop > Affiliate > Product Marketplace. Search for Loop and click 'Request Sample'. If you got a collab invite, accept it to request samples!",
+      "How do I request a sample if my request expired?": "Just submit a new request through TikTok Shop. Requests expire after a set period — resubmit and we'll review it!",
+      "What are flash sales for lives?": "Flash sales are special discounted prices we set up for creators going live. They help boost conversions during your stream! Let us know in #lives-chat when you're planning to go live.",
+      "How do I set up flash sales?": "Let us know your TikTok handle and when you plan to go live in #lives-chat, and we'll get flash sale pricing set up for you!",
+      "What's the difference between Loop earplug models?": "Loop Quiet is for silence (sleep, focus). Loop Experience is for music/events (reduces volume, keeps clarity). Loop Engage is for conversations (reduces background noise). Loop Switch combines all three modes!",
+      "Where do I send my Spark code?": "Drop your Spark codes in the #spark-code channel!",
+      "How do I sign up for challenges?": "Check #announcements for current challenges. Requirements and sign-up details are always posted there!",
+      "When do challenge payouts happen?": "Payout timelines are shared in the challenge announcement. If you've completed a challenge, make sure you've submitted all required content and your invoice.",
+      "Can I promote on multiple accounts?": "Generally one account per creator for challenges unless specified otherwise. Check the specific challenge rules in #announcements.",
+      "How do I submit my invoice for a challenge?": "Email your invoice with your TikTok handle, videos posted, and payment details as outlined in the challenge announcement."
+    }
+  },
+  "1427682273540571280": {
+    "brandName": "Tiesta Tea",
+    "brandVoice": "Cozy, friendly, tea-lover vibes. Warm and welcoming — like inviting someone for a cup of tea.",
+    "context": [
+      "Tiesta Tea makes loose-leaf tea blends, iced teas, cold brew teas, and tea accessories.",
+      "Products include variety packs, individual tea flavors, and infusers available on TikTok Shop.",
+      "Creators promote via TikTok Shop affiliate links.",
+      "Samples are requested through TikTok Shop's affiliate sample request system."
+    ],
+    "faq": {
+      "How do I get samples?": "Go to TikTok Shop > Affiliate > Product Marketplace, search for Tiesta Tea, and click 'Request Sample'. We review requests regularly!",
+      "Can I get coupons for my viewers?": "Great idea! Check #campaigns-incentives for any active coupon codes or promotions you can share with your audience.",
+      "Are cold brew teas available for samples?": "Check the TikTok Shop listing for current sample availability. Product availability for samples can change, so keep checking back!",
+      "How does the affiliate program work?": "Find Tiesta Tea on TikTok Shop's Affiliate Marketplace, add products to your showcase, and earn commission on every sale through your link!",
+      "Where do I send my Spark code?": "Drop your Spark codes in the #spark-code channel!",
+      "What hashtags should I use?": "Check #campaigns-incentives for any campaign-specific hashtags. Generally, use the brand name and relevant tea/lifestyle tags!"
+    }
+  },
+  "1400441698664054804": {
+    "brandName": "KetoneIQ",
+    "brandVoice": "Energetic, fitness-forward, and direct. Like a supportive gym buddy who knows their stuff. Straightforward and transparent.",
+    "context": [
+      "KetoneIQ makes ketone drinks/shots for energy, focus, and performance — used by athletes and productivity-focused people.",
+      "Products include ketone shots in various flavors (including grape) available on TikTok Shop.",
+      "Active challenge/campaign community — creators earn payouts for completing video challenges.",
+      "Creators promote via TikTok Shop affiliate links.",
+      "Challenges have specific rules: video count requirements, GMV thresholds, view minimums, and deadlines.",
+      "Payouts for challenges require invoice submission via email.",
+      "TikTok community guidelines can sometimes flag health/supplement content — creators should appeal if videos are wrongly removed."
+    ],
+    "faq": {
+      "How do I get samples?": "Go to TikTok Shop > Affiliate > Product Marketplace, search for KetoneIQ, and click 'Request Sample'. We approve requests regularly!",
+      "How do I sign up for a challenge?": "Check #announcements for the latest challenge details including rules, requirements, and how to participate!",
+      "When do challenge payouts happen?": "Payout timelines are shared in each challenge announcement. Once you've completed the requirements, submit your invoice via email as instructed.",
+      "How do I submit my invoice?": "Send your invoice with your TikTok handle, list of videos posted, and payment details to the email specified in the challenge announcement.",
+      "Is payment through PayPal?": "Payment method details are included in the challenge payout instructions. Follow the invoicing steps shared in #announcements.",
+      "What are the GMV requirements?": "GMV requirements vary by challenge. Check the specific challenge rules in #announcements for current thresholds.",
+      "What if my video gets a violation?": "Don't delete the video! Appeal it through TikTok's review process. Health/supplement content can sometimes get flagged incorrectly — appeals usually get resolved.",
+      "Can I use BOF (begin of funnel) content?": "Check the specific challenge brief for content format requirements. Some challenges allow BOF/faceless content, others require specific formats.",
+      "What's the challenge deadline?": "Deadlines are posted with each challenge in #announcements. Make sure to check the latest update as rules can change!",
+      "Where do I send my Spark code?": "Drop your Spark codes in the #spark-code channel!"
     }
   }
 }
