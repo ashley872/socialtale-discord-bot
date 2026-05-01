@@ -36,6 +36,11 @@ const ALERT_CHANNEL_NAME = CONFIG.alertChannelName || 'team-alerts';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
+// Hub Supabase — for reading creator video performance data
+const hubSupabase = (process.env.HUB_SUPABASE_URL && process.env.HUB_SUPABASE_KEY)
+  ? createClient(process.env.HUB_SUPABASE_URL, process.env.HUB_SUPABASE_KEY)
+  : null;
+
 // ── Brand Contexts (AI Auto-Reply) ──────────────────────────────────────────
 const BRAND_CONTEXTS = JSON.parse(readFileSync(path.join(__dirname, 'brand-contexts.json'), 'utf8'));
 const DEFAULT_BRAND = BRAND_CONTEXTS._default;
@@ -321,6 +326,125 @@ async function handleStatusCommand(message) {
 
   await message.reply({ embeds: [embed] });
   return true;
+}
+
+// ── Content Inspiration (!inspire command + weekly scheduled) ────────────────
+async function getTopVideosForServer(serverId, limit = 5) {
+  if (!hubSupabase) return [];
+
+  // Look up brand_id from discord_server_id
+  const { data: brand } = await hubSupabase
+    .from('brands')
+    .select('id, name')
+    .eq('discord_server_id', serverId)
+    .single();
+
+  if (!brand) return [];
+
+  // Get top videos from last 30 days
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
+  const today = new Date().toISOString().split('T')[0];
+
+  const { data: videos } = await hubSupabase
+    .from('creator_videos')
+    .select('video_url, tiktok_account, views, gmv, orders, likes, comments, shares, post_date')
+    .eq('brand_id', brand.id)
+    .gte('post_date', thirtyDaysAgo)
+    .lte('post_date', today)
+    .order('views', { ascending: false })
+    .limit(limit);
+
+  return (videos || []).filter(v => v.video_url && v.views > 0);
+}
+
+function formatViews(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return String(n);
+}
+
+async function postContentInspiration(guild, targetChannel) {
+  const videos = await getTopVideosForServer(guild.id);
+  if (!videos.length) return false;
+
+  const brandCtx = getBrandContext(guild.id);
+  const brandName = brandCtx.brandName || guild.name;
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Top Performing Content This Month`)
+    .setDescription(`Here's what's been working — use these as inspiration for your next video!`)
+    .setColor(0x10B981)
+    .setTimestamp();
+
+  for (const [i, v] of videos.entries()) {
+    const creator = v.tiktok_account ? `@${v.tiktok_account}` : 'Creator';
+    const stats = [
+      `${formatViews(v.views)} views`,
+      v.orders > 0 ? `${v.orders} orders` : null,
+      v.likes > 0 ? `${formatViews(v.likes)} likes` : null,
+    ].filter(Boolean).join(' · ');
+
+    embed.addFields({
+      name: `${i + 1}. ${creator}`,
+      value: `${stats}\n[Watch video](${v.video_url})`,
+    });
+  }
+
+  embed.setFooter({ text: 'Keep creating authentic content — these prove it works!' });
+
+  // Post via webhook as brand
+  const webhook = await getOrCreateWebhook(targetChannel, brandName);
+  if (webhook) {
+    await webhook.send({
+      embeds: [embed],
+      username: brandName,
+      avatarURL: guild.iconURL({ size: 128 }),
+    });
+  } else {
+    await targetChannel.send({ embeds: [embed] });
+  }
+
+  console.log(`Content inspiration posted in #${targetChannel.name} (${guild.name}) — ${videos.length} videos`);
+  return true;
+}
+
+async function handleInspireCommand(message) {
+  if (message.content !== '!inspire') return false;
+  if (!isTeamMember(message.member)) return false;
+
+  if (!hubSupabase) {
+    await message.reply('Hub database not connected — set HUB_SUPABASE_URL and HUB_SUPABASE_KEY env vars.');
+    return true;
+  }
+
+  const posted = await postContentInspiration(message.guild, message.channel);
+  if (!posted) {
+    await message.reply('No video performance data available for this brand yet. Make sure Euka sync is running in the Hub.');
+  }
+
+  try { await message.delete(); } catch (_) {}
+  return true;
+}
+
+// Weekly content inspiration (every Monday at 10:00)
+async function postWeeklyInspiration() {
+  if (!hubSupabase) return;
+
+  for (const [, guild] of client.guilds.cache) {
+    try {
+      // Find the best channel to post in (content-inspiration, announcements, or general)
+      const textChannels = guild.channels.cache.filter(c => c.type === 0);
+      const target = textChannels.find(c => c.name.includes('content') || c.name.includes('inspiration'))
+        || textChannels.find(c => c.name.includes('announcement'))
+        || textChannels.find(c => c.name.includes('general') || c.name.includes('chat'));
+
+      if (!target) continue;
+
+      await postContentInspiration(guild, target);
+    } catch (err) {
+      console.error(`Weekly inspiration error for ${guild.name}:`, err.message);
+    }
+  }
 }
 
 // ── Daily Metrics Snapshot (all servers) ─────────────────────────────────────
@@ -730,6 +854,9 @@ client.on('ready', async () => {
   // Daily snapshot at 23:55, digest at 09:00
   scheduleDaily(23, 55, takeMetricsSnapshot);
   scheduleDaily(9, 0, postDailyDigest);
+
+  // Weekly content inspiration — Monday at 10:00
+  scheduleWeekly(1, 10, 0, postWeeklyInspiration);
 });
 
 // Auto-onboard new servers
@@ -756,6 +883,7 @@ client.on('messageCreate', async (message) => {
 
   if (await handleProxyCommand(message)) return;
   if (await handleStatusCommand(message)) return;
+  if (await handleInspireCommand(message)) return;
 
   await trackMessage(message, isTeam);
 
@@ -808,6 +936,20 @@ function scheduleDaily(hour, minute, fn) {
   const delay = next - now;
   setTimeout(() => { fn(); setInterval(fn, 86400000); }, delay);
   console.log(`Scheduled ${hour}:${String(minute).padStart(2, '0')} (next in ${Math.floor(delay / 3600000)}h ${Math.floor((delay % 3600000) / 60000)}m)`);
+}
+
+function scheduleWeekly(dayOfWeek, hour, minute, fn) {
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const now = new Date();
+  let next = new Date(now);
+  next.setHours(hour, minute, 0, 0);
+  // Find next occurrence of the target day
+  while (next.getDay() !== dayOfWeek || next <= now) {
+    next.setDate(next.getDate() + 1);
+  }
+  const delay = next - now;
+  setTimeout(() => { fn(); setInterval(fn, 7 * 86400000); }, delay);
+  console.log(`Scheduled ${days[dayOfWeek]} ${hour}:${String(minute).padStart(2, '0')} weekly (next in ${Math.floor(delay / 86400000)}d ${Math.floor((delay % 86400000) / 3600000)}h)`);
 }
 
 // ── Start ───────────────────────────────────────────────────────────────────
