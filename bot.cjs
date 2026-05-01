@@ -332,8 +332,9 @@ async function takeMetricsSnapshot() {
   for (const [, guild] of client.guilds.cache) {
     const serverId = guild.id;
 
+    // ── Messages today ──
     const { data: todayMessages } = await supabase.from('discord_messages')
-      .select('author_id, is_team_member, is_answered')
+      .select('author_id, author_name, is_team_member, is_answered, channel_name, replied_by')
       .eq('discord_server_id', serverId)
       .gte('created_at', todayStart).lte('created_at', todayEnd);
 
@@ -341,8 +342,9 @@ async function takeMetricsSnapshot() {
     const uniqueAuthors = new Set(todayMessages?.map(m => m.author_id) || []);
     const memberMessages = todayMessages?.filter(m => !m.is_team_member) || [];
 
+    // ── Response times ──
     const { data: responseTimes } = await supabase.from('discord_messages')
-      .select('reply_time_seconds')
+      .select('reply_time_seconds, replied_by')
       .eq('discord_server_id', serverId).eq('is_answered', true)
       .not('reply_time_seconds', 'is', null)
       .gte('created_at', todayStart).lte('created_at', todayEnd);
@@ -350,6 +352,7 @@ async function takeMetricsSnapshot() {
     const avgResponseTime = responseTimes?.length
       ? Math.round(responseTimes.reduce((a, b) => a + b.reply_time_seconds, 0) / responseTimes.length) : null;
 
+    // ── DAU / WAU / MAU ──
     const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
     const { data: weekMsgs } = await supabase.from('discord_messages').select('author_id')
       .eq('discord_server_id', serverId).gte('created_at', weekAgo);
@@ -363,12 +366,97 @@ async function takeMetricsSnapshot() {
     const dau = dailyActiveUsers.get(serverId)?.size || uniqueAuthors.size;
     const stickiness = mau > 0 ? Math.round((dau / mau) * 10000) / 100 : 0;
 
+    // ── Member growth (joins/leaves today) ──
+    const { data: joinEvents } = await supabase.from('discord_member_events')
+      .select('user_id').eq('discord_server_id', serverId).eq('event_type', 'join')
+      .gte('created_at', todayStart).lte('created_at', todayEnd);
+    const { data: leaveEvents } = await supabase.from('discord_member_events')
+      .select('user_id').eq('discord_server_id', serverId).eq('event_type', 'leave')
+      .gte('created_at', todayStart).lte('created_at', todayEnd);
+    const newJoins = joinEvents?.length || 0;
+    const leaves = leaveEvents?.length || 0;
+
+    // ── Per-channel activity ──
+    const channelActivity = {};
+    for (const msg of (todayMessages || [])) {
+      const ch = msg.channel_name || 'unknown';
+      channelActivity[ch] = (channelActivity[ch] || 0) + 1;
+    }
+
+    // ── Top contributors (non-team, top 10 by message count today) ──
+    const authorCounts = {};
+    for (const msg of (memberMessages || [])) {
+      const name = msg.author_name || msg.author_id;
+      authorCounts[name] = (authorCounts[name] || 0) + 1;
+    }
+    const topContributors = Object.entries(authorCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([name, count]) => ({ name, count }));
+
+    // ── Cohort retention (monthly cohorts based on first message date) ──
+    let cohortData = null;
+    try {
+      // Get all messages for this server to build cohorts
+      const { data: allMsgs } = await supabase.from('discord_messages')
+        .select('author_id, created_at')
+        .eq('discord_server_id', serverId)
+        .eq('is_team_member', false)
+        .order('created_at', { ascending: true });
+
+      if (allMsgs?.length) {
+        // Find each user's first message month (cohort) and all active months
+        const userFirstMonth = {};
+        const userActiveMonths = {};
+        for (const msg of allMsgs) {
+          const month = msg.created_at.substring(0, 7); // YYYY-MM
+          if (!userFirstMonth[msg.author_id]) userFirstMonth[msg.author_id] = month;
+          if (!userActiveMonths[msg.author_id]) userActiveMonths[msg.author_id] = new Set();
+          userActiveMonths[msg.author_id].add(month);
+        }
+
+        // Build cohort retention table
+        const cohorts = {};
+        for (const [userId, firstMonth] of Object.entries(userFirstMonth)) {
+          if (!cohorts[firstMonth]) cohorts[firstMonth] = { count: 0, retention: {} };
+          cohorts[firstMonth].count++;
+          for (const activeMonth of userActiveMonths[userId]) {
+            if (!cohorts[firstMonth].retention[activeMonth]) cohorts[firstMonth].retention[activeMonth] = 0;
+            cohorts[firstMonth].retention[activeMonth]++;
+          }
+        }
+
+        // Convert to offset-based format (M0, M1, M2...)
+        const sortedCohortMonths = Object.keys(cohorts).sort();
+        const allMonths = [...new Set(allMsgs.map(m => m.created_at.substring(0, 7)))].sort();
+
+        cohortData = sortedCohortMonths.map(cohortMonth => {
+          const c = cohorts[cohortMonth];
+          const cohortIdx = allMonths.indexOf(cohortMonth);
+          const retention = {};
+          for (const [activeMonth, activeCount] of Object.entries(c.retention)) {
+            const offset = allMonths.indexOf(activeMonth) - cohortIdx;
+            if (offset >= 0) {
+              retention[`M${offset}`] = Math.round((activeCount / c.count) * 100);
+            }
+          }
+          return { cohortMonth, count: c.count, retention };
+        });
+      }
+    } catch (err) {
+      console.error('Cohort calc error:', err.message);
+    }
+
+    // ── Upsert snapshot ──
     await supabase.from('discord_community_metrics').upsert({
       discord_server_id: serverId,
       server_name: guild.name,
       snapshot_date: today,
       total_members: guild.memberCount,
       online_members: guild.approximatePresenceCount || 0,
+      new_joins: newJoins,
+      leaves,
+      net_growth: newJoins - leaves,
       total_messages: totalMsgs,
       unique_messagers: uniqueAuthors.size,
       messages_from_members: memberMessages.length,
@@ -377,9 +465,12 @@ async function takeMetricsSnapshot() {
       avg_response_time_seconds: avgResponseTime,
       dau, wau, mau,
       stickiness_ratio: stickiness,
+      channel_activity: channelActivity,
+      top_contributors: topContributors,
+      cohort_data: cohortData,
     }, { onConflict: 'discord_server_id,snapshot_date' });
 
-    console.log(`Snapshot: ${guild.name} — ${totalMsgs} msgs, ${dau} DAU, ${mau} MAU`);
+    console.log(`Snapshot: ${guild.name} — ${totalMsgs} msgs, ${dau} DAU, ${mau} MAU, +${newJoins}/-${leaves} members`);
     dailyActiveUsers.set(serverId, new Set());
   }
 }
@@ -398,6 +489,31 @@ async function postDailyDigest() {
     const avgMins = metrics.avg_response_time_seconds
       ? Math.round(metrics.avg_response_time_seconds / 60) : 'N/A';
 
+    // Growth stats
+    const growthSign = metrics.net_growth >= 0 ? '+' : '';
+    const growthText = `+${metrics.new_joins || 0} joined / -${metrics.leaves || 0} left (net: ${growthSign}${metrics.net_growth || 0})`;
+
+    // Top contributors
+    const topContribs = metrics.top_contributors || [];
+    const topText = topContribs.length > 0
+      ? topContribs.slice(0, 3).map((c, i) => `${i + 1}. ${c.name} (${c.count} msgs)`).join('\n')
+      : 'No community messages';
+
+    // Cohort highlight
+    let cohortHighlight = '';
+    if (metrics.cohort_data?.length) {
+      const latest = metrics.cohort_data[metrics.cohort_data.length - 1];
+      const olderCohorts = metrics.cohort_data.filter(c => Object.keys(c.retention).length > 1);
+      if (olderCohorts.length > 0) {
+        const c = olderCohorts[olderCohorts.length - 1];
+        const offsets = Object.keys(c.retention).filter(k => k !== 'M0').sort();
+        const lastOffset = offsets[offsets.length - 1];
+        if (lastOffset) {
+          cohortHighlight = `${c.cohortMonth} cohort (${c.count} creators): ${c.retention[lastOffset]}% still active at ${lastOffset}`;
+        }
+      }
+    }
+
     // Discord embed
     const alertChannel = await getOrCreateAlertChannel(guild);
     if (alertChannel) {
@@ -406,13 +522,19 @@ async function postDailyDigest() {
         .setColor(responseRate >= 90 ? 0x00CC66 : responseRate >= 70 ? 0xFFAA00 : 0xFF4444)
         .addFields(
           { name: 'Members', value: `${metrics.total_members} total`, inline: true },
+          { name: 'Growth', value: growthText, inline: true },
           { name: 'Messages', value: `${metrics.total_messages} (${metrics.unique_messagers} people)`, inline: true },
           { name: 'Response Rate', value: `${responseRate}%`, inline: true },
           { name: 'Avg Response Time', value: `${avgMins} min`, inline: true },
           { name: 'Unanswered', value: `${metrics.messages_unanswered}`, inline: true },
           { name: 'DAU / WAU / MAU', value: `${metrics.dau} / ${metrics.wau} / ${metrics.mau}`, inline: true },
           { name: 'Stickiness', value: `${metrics.stickiness_ratio}%`, inline: true },
+          { name: 'Top Contributors', value: topText, inline: false },
         ).setTimestamp();
+
+      if (cohortHighlight) {
+        embed.addFields({ name: 'Retention', value: cohortHighlight });
+      }
 
       if (metrics.messages_unanswered > 0) {
         const { data: unanswered } = await supabase.from('discord_messages')
@@ -433,6 +555,7 @@ async function postDailyDigest() {
       { type: 'header', text: { type: 'plain_text', text: `${guild.name} Community Digest — ${yesterday}` } },
       { type: 'section', fields: [
         { type: 'mrkdwn', text: `*Members:* ${metrics.total_members}` },
+        { type: 'mrkdwn', text: `*Growth:* ${growthText}` },
         { type: 'mrkdwn', text: `*Messages:* ${metrics.total_messages} (${metrics.unique_messagers} people)` },
         { type: 'mrkdwn', text: `*Response Rate:* ${emoji} ${responseRate}%` },
         { type: 'mrkdwn', text: `*Avg Response:* ${avgMins} min` },
@@ -440,7 +563,11 @@ async function postDailyDigest() {
         { type: 'mrkdwn', text: `*DAU / WAU / MAU:* ${metrics.dau} / ${metrics.wau} / ${metrics.mau}` },
         { type: 'mrkdwn', text: `*Stickiness:* ${metrics.stickiness_ratio}%` },
       ]},
+      { type: 'section', text: { type: 'mrkdwn', text: `*Top Contributors:*\n${topText}` } },
     ];
+    if (cohortHighlight) {
+      slackBlocks.push({ type: 'section', text: { type: 'mrkdwn', text: `:chart_with_upwards_trend: *Retention:* ${cohortHighlight}` } });
+    }
     if (metrics.messages_unanswered > 0) {
       slackBlocks.push({ type: 'section', text: { type: 'mrkdwn',
         text: `:warning: *${metrics.messages_unanswered} message(s) still unanswered from yesterday*` } });
@@ -647,12 +774,28 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-client.on('guildMemberAdd', (member) => {
+client.on('guildMemberAdd', async (member) => {
   console.log(`[${member.guild.name}] Joined: ${member.user.username}`);
+  try {
+    await supabase.from('discord_member_events').insert({
+      discord_server_id: member.guild.id,
+      user_id: member.user.id,
+      username: member.user.username,
+      event_type: 'join',
+    });
+  } catch (err) { console.error('Member join track error:', err.message); }
 });
 
-client.on('guildMemberRemove', (member) => {
+client.on('guildMemberRemove', async (member) => {
   console.log(`[${member.guild.name}] Left: ${member.user.username}`);
+  try {
+    await supabase.from('discord_member_events').insert({
+      discord_server_id: member.guild.id,
+      user_id: member.user.id,
+      username: member.user.username,
+      event_type: 'leave',
+    });
+  } catch (err) { console.error('Member leave track error:', err.message); }
 });
 
 // ── Scheduling ──────────────────────────────────────────────────────────────
