@@ -889,6 +889,124 @@ function cancelAutoReply(messageId) {
   }
 }
 
+// ── Startup Catchup — reply to recent unanswered messages ────────────────────
+async function catchUpUnanswered() {
+  const CATCHUP_HOURS = 4; // only look back this far
+  const CATCHUP_DELAY_MS = 5000; // 5s between replies to avoid flooding
+  const cutoff = new Date(Date.now() - CATCHUP_HOURS * 3600000);
+  let totalCaughtUp = 0;
+
+  for (const [, guild] of client.guilds.cache) {
+    const brandCtx = getBrandContext(guild.id);
+    if (!brandCtx.autoReplyEnabled) continue;
+
+    const excludeChannels = brandCtx.excludeChannels || defaultBotConfig.excludeChannels || [];
+
+    // Get text channels the bot can read
+    const textChannels = guild.channels.cache.filter(c =>
+      c.type === 0 &&
+      c.permissionsFor(client.user)?.has(['ViewChannel', 'SendMessages', 'ReadMessageHistory']) &&
+      !excludeChannels.some(ex => c.name.includes(ex))
+    );
+
+    for (const [, channel] of textChannels) {
+      try {
+        // Fetch last 50 messages from this channel
+        const messages = await channel.messages.fetch({ limit: 50 });
+        const recent = messages.filter(m =>
+          m.createdAt > cutoff &&
+          !m.author.bot &&
+          m.content?.trim().length > 0
+        ).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+        for (const [, msg] of recent) {
+          // Skip if from team
+          let memberObj = msg.member;
+          if (!memberObj) {
+            try { memberObj = await guild.members.fetch(msg.author.id); } catch (_) {}
+          }
+          if (isTeamMember(memberObj)) continue;
+
+          // Check if anyone replied after this message in the channel
+          const laterMessages = messages.filter(m =>
+            m.createdTimestamp > msg.createdTimestamp &&
+            (m.author.bot || (m.member && isTeamMember(m.member))) &&
+            (m.reference?.messageId === msg.id || m.createdTimestamp - msg.createdTimestamp < 3600000)
+          );
+          if (laterMessages.size > 0) continue;
+
+          // Check if already answered in DB
+          const { data: existing } = await supabase.from('discord_messages')
+            .select('is_answered')
+            .eq('discord_message_id', msg.id)
+            .eq('discord_server_id', guild.id)
+            .single();
+          if (existing?.is_answered) continue;
+
+          // Rate limit check
+          if (isAutoReplyRateLimited(guild.id)) break;
+
+          // Generate and send reply
+          const reply = await generateAutoReply(msg, brandCtx);
+          if (!reply) continue;
+
+          const mention = `<@${msg.author.id}>`;
+          const webhook = await getOrCreateWebhook(channel, brandCtx.brandName || guild.name);
+          if (webhook) {
+            await webhook.send({
+              content: `${mention} ${reply}`,
+              username: brandCtx.brandName || guild.name,
+              avatarURL: guild.iconURL({ size: 128 }),
+            });
+          } else {
+            await msg.reply(reply);
+          }
+
+          incrementAutoReplyCount(guild.id);
+          totalCaughtUp++;
+
+          // Track in DB
+          await supabase.from('discord_messages').upsert({
+            discord_message_id: msg.id,
+            discord_server_id: guild.id,
+            discord_channel_id: channel.id,
+            channel_name: channel.name,
+            author_id: msg.author.id,
+            author_name: msg.author.displayName || msg.author.username,
+            is_team_member: false,
+            content_preview: msg.content?.substring(0, 100) || '(no text)',
+            created_at: msg.createdAt.toISOString(),
+            is_answered: true,
+            replied_at: new Date().toISOString(),
+            replied_by: 'auto-reply-catchup',
+            reply_time_seconds: Math.floor((Date.now() - msg.createdTimestamp) / 1000),
+          }, { onConflict: 'discord_message_id,discord_server_id' });
+
+          console.log(`[Catchup] Replied in #${channel.name} (${guild.name}): ${reply.substring(0, 80)}...`);
+
+          // Notify Slack
+          await slackAlert(`Catchup auto-reply in ${guild.name} Discord`, [
+            { type: 'section', text: { type: 'mrkdwn',
+              text: `*#${channel.name}* — ${msg.author.username} asked:\n>${msg.content.substring(0, 200)}\n\n*Bot replied:*\n${reply}` } },
+            { type: 'context', elements: [{ type: 'mrkdwn', text: ':arrows_counterclockwise: Startup catchup — message was unanswered' }] },
+          ]);
+
+          // Throttle to avoid flooding
+          await new Promise(r => setTimeout(r, CATCHUP_DELAY_MS));
+        }
+      } catch (err) {
+        console.error(`[Catchup] Error in #${channel.name} (${guild.name}):`, err.message);
+      }
+    }
+  }
+
+  if (totalCaughtUp > 0) {
+    console.log(`[Catchup] Replied to ${totalCaughtUp} unanswered message(s) across all servers`);
+  } else {
+    console.log(`[Catchup] No unanswered messages to catch up on`);
+  }
+}
+
 // ── Event Handlers ──────────────────────────────────────────────────────────
 client.on('ready', async () => {
   const serverNames = client.guilds.cache.map(g => `${g.name} (${g.memberCount} members)`);
@@ -898,6 +1016,9 @@ client.on('ready', async () => {
   // Load bot config from Hub Supabase (non-blocking on failure — falls back to static JSON)
   await loadBotConfigFromDB().catch(err => console.error('Initial config load failed:', err.message));
   setInterval(loadBotConfigFromDB, CONFIG_POLL_MS);
+
+  // Catch up on unanswered messages from before the bot was running
+  await catchUpUnanswered().catch(err => console.error('Catchup error:', err.message));
 
   // Check unanswered every 5 minutes
   setInterval(checkUnanswered, 5 * 60 * 1000);
