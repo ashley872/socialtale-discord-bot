@@ -806,7 +806,7 @@ Rules:
     });
 
     const reply = response.content[0]?.text?.trim();
-    if (!reply || reply === 'NO_REPLY') return null;
+    if (!reply || reply.includes('NO_REPLY')) return null;
     return reply;
   } catch (err) {
     console.error('AI reply error:', err.message);
