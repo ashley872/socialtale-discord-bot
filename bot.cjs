@@ -72,9 +72,9 @@ async function loadBotConfigFromDB() {
     if (error) { console.error('Bot config DB load error:', error.message); return; }
     if (!data || data.length === 0) return; // no rows yet — keep static
 
-    const newCache = new Map();
+    // MERGE DB config on top of static JSON — never wipe static-only fields like `conversational`
     for (const row of data) {
-      const config = {
+      const dbConfig = {
         brandName:             row.brand_name,
         brandVoice:            row.brand_voice,
         context:               row.context_lines || [],
@@ -84,16 +84,21 @@ async function loadBotConfigFromDB() {
         maxRepliesPerHour:     row.max_replies_per_hour,
         excludeChannels:       row.exclude_channels || [],
         confidenceThreshold:   row.confidence_threshold,
-        conversational:        row.conversational || false,
       };
+      // Only set conversational if DB explicitly has it; otherwise preserve static JSON value
+      if (row.conversational !== undefined && row.conversational !== null) {
+        dbConfig.conversational = row.conversational;
+      }
+
       if (row.discord_server_id === '_default') {
-        defaultBotConfig = config;
+        defaultBotConfig = { ...defaultBotConfig, ...dbConfig };
       } else {
-        newCache.set(row.discord_server_id, config);
+        // Merge: static JSON first, then DB overrides on top
+        const staticConfig = STATIC_BRAND_CONTEXTS[row.discord_server_id] || {};
+        botConfigCache.set(row.discord_server_id, { ...staticConfig, ...dbConfig });
       }
     }
-    botConfigCache = newCache;
-    console.log(`Bot config loaded from DB: ${newCache.size} servers + default`);
+    console.log(`Bot config merged from DB: ${data.length} row(s) applied on top of static JSON`);
   } catch (err) {
     console.error('loadBotConfigFromDB error:', err.message);
   }
@@ -950,8 +955,9 @@ function scheduleAutoReply(message) {
   const channelName = message.channel.name.replace(/[^\w-]/g, ''); // strip emojis for matching
   if (excludeChannels.some(ex => message.channel.name.includes(ex) || channelName.includes(ex))) return;
 
-  // Busy channel cooldown — if chat is very active, skip some replies
-  if (brandCtx.conversational) {
+  // Busy channel cooldown — only for brand servers (non-conversational)
+  // Conversational servers (Social Tale) skip this — Alice is the sole community manager
+  if (!brandCtx.conversational) {
     const recentInChannel = message.channel.messages.cache.filter(m =>
       Date.now() - m.createdTimestamp < 5 * 60 * 1000 && !m.author.bot
     ).size;
