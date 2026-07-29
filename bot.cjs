@@ -42,9 +42,56 @@ const hubSupabase = (process.env.HUB_SUPABASE_URL && process.env.HUB_SUPABASE_KE
   : null;
 
 // ── Brand Contexts (AI Auto-Reply) ──────────────────────────────────────────
-const BRAND_CONTEXTS = JSON.parse(readFileSync(path.join(__dirname, 'brand-contexts.json'), 'utf8'));
-const DEFAULT_BRAND = BRAND_CONTEXTS._default;
-const AUTO_REPLY_DELAY_MS = (DEFAULT_BRAND.autoReplyDelayMinutes || 15) * 60 * 1000;
+// Load static JSON as baseline fallback, then poll Hub Supabase every 5 minutes
+const STATIC_BRAND_CONTEXTS = JSON.parse(readFileSync(path.join(__dirname, 'brand-contexts.json'), 'utf8'));
+const STATIC_DEFAULT = STATIC_BRAND_CONTEXTS._default;
+
+// Mutable cache — updated by DB poll
+let defaultBotConfig = { ...STATIC_DEFAULT };
+let botConfigCache = new Map(); // discord_server_id → config object
+const CONFIG_POLL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Seed cache from static JSON
+for (const [k, v] of Object.entries(STATIC_BRAND_CONTEXTS)) {
+  if (k === '_default') continue;
+  botConfigCache.set(k, v);
+}
+
+async function loadBotConfigFromDB() {
+  if (!hubSupabase) return;
+  try {
+    const { data, error } = await hubSupabase
+      .from('discord_bot_config')
+      .select('*');
+    if (error) { console.error('Bot config DB load error:', error.message); return; }
+    if (!data || data.length === 0) return; // no rows yet — keep static
+
+    const newCache = new Map();
+    for (const row of data) {
+      const config = {
+        brandName:             row.brand_name,
+        brandVoice:            row.brand_voice,
+        context:               row.context_lines || [],
+        faq:                   Object.fromEntries((row.faq || []).map(f => [f.question, f.answer])),
+        autoReplyEnabled:      row.auto_reply_enabled,
+        autoReplyDelayMinutes: row.auto_reply_delay_mins,
+        maxRepliesPerHour:     row.max_replies_per_hour,
+        excludeChannels:       row.exclude_channels || [],
+        confidenceThreshold:   row.confidence_threshold,
+      };
+      if (row.discord_server_id === '_default') {
+        defaultBotConfig = config;
+      } else {
+        newCache.set(row.discord_server_id, config);
+      }
+    }
+    botConfigCache = newCache;
+    console.log(`Bot config loaded from DB: ${newCache.size} servers + default`);
+  } catch (err) {
+    console.error('loadBotConfigFromDB error:', err.message);
+  }
+}
+
 const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 
 // Track auto-reply rate limiting: serverId → { count, resetTime }
@@ -704,7 +751,7 @@ async function postDailyDigest() {
 
 // ── AI Auto-Reply ───────────────────────────────────────────────────────────
 function getBrandContext(serverId) {
-  return { ...DEFAULT_BRAND, ...(BRAND_CONTEXTS[serverId] || {}) };
+  return { ...defaultBotConfig, ...(botConfigCache.get(serverId) || {}) };
 }
 
 function isAutoReplyRateLimited(serverId) {
@@ -847,6 +894,10 @@ client.on('ready', async () => {
   const serverNames = client.guilds.cache.map(g => `${g.name} (${g.memberCount} members)`);
   console.log(`Bot logged in as ${client.user.tag}`);
   console.log(`Auto-monitoring ${serverNames.length} server(s): ${serverNames.join(', ')}`);
+
+  // Load bot config from Hub Supabase (non-blocking on failure — falls back to static JSON)
+  await loadBotConfigFromDB().catch(err => console.error('Initial config load failed:', err.message));
+  setInterval(loadBotConfigFromDB, CONFIG_POLL_MS);
 
   // Check unanswered every 5 minutes
   setInterval(checkUnanswered, 5 * 60 * 1000);
