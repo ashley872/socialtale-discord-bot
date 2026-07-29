@@ -798,10 +798,12 @@ async function generateAutoReply(message, brandCtx) {
 - When someone shares a win or update, celebrate with them and ask what's next.
 - When someone says hi or posts casually, respond naturally like a friendly colleague would.
 - Keep conversations going by asking genuine questions about their content, goals, or experience.
-- Do not make up information about Social Tale services or specific details. Use the brand context and FAQ below.
+- NEVER say "I don't have specific details" or "I'm not sure about the details" — if you know the answer from the context/FAQ, just say it confidently and casually. If you genuinely don't know, just point them to the right channel or say "the team can help with that".
+- NEVER ask clarifying questions when you already have the answer. If someone asks about retainers, just tell them — don't ask "which brand?" or "what kind of retainer?".
+- Do not make up specific numbers, dates, or offers. But DO speak confidently about things covered in the brand context and FAQ.
+- Talk like a real person in a group chat — casual, no corporate speak, no hedging language.
 - Match the casual, friendly tone of Discord. Use emojis naturally but sparingly.
-- Only reply with NO_REPLY if the message is completely irrelevant, spam, or you genuinely have nothing to add.
-- If someone asks a specific question not covered in FAQ/context, still be helpful — acknowledge their question and suggest they check the relevant channel or ask the team directly.`;
+- Only reply with NO_REPLY if the message is completely irrelevant, spam, or you genuinely have nothing to add.`;
 
   const systemPrompt = `You are ${isConversational ? 'Alice, a friendly team member at' : 'replying as'} ${brandCtx.brandName || 'the brand'} in a Discord community server${isConversational ? '' : ' for creators and affiliates'}.
 
@@ -992,7 +994,10 @@ function scheduleEngagement() {
 }
 
 // ── Startup Catchup — reply to recent unanswered messages ────────────────────
+let isCatchingUp = false; // bypass rate limit during catchup
+
 async function catchUpUnanswered() {
+  isCatchingUp = true;
   const CATCHUP_HOURS = parseInt(process.env.CATCHUP_HOURS || '4', 10); // default 4h, override via env
   const CATCHUP_DELAY_MS = 5000; // 5s between replies to avoid flooding
   console.log(`[Catchup] Looking back ${CATCHUP_HOURS} hours`);
@@ -1014,8 +1019,8 @@ async function catchUpUnanswered() {
 
     for (const [, channel] of textChannels) {
       try {
-        // Fetch last 50 messages from this channel
-        const messages = await channel.messages.fetch({ limit: 50 });
+        // Fetch last 100 messages from this channel (more coverage for 7-day window)
+        const messages = await channel.messages.fetch({ limit: 100 });
         const recent = messages.filter(m =>
           m.createdAt > cutoff &&
           !m.author.bot &&
@@ -1030,13 +1035,12 @@ async function catchUpUnanswered() {
           }
           if (isTeamMember(memberObj)) continue;
 
-          // Check if anyone replied after this message in the channel
-          const laterMessages = messages.filter(m =>
-            m.createdTimestamp > msg.createdTimestamp &&
-            (m.author.bot || (m.member && isTeamMember(m.member))) &&
-            (m.reference?.messageId === msg.id || m.createdTimestamp - msg.createdTimestamp < 3600000)
+          // Only skip if someone directly replied to this specific message
+          const directReply = messages.find(m =>
+            m.reference?.messageId === msg.id &&
+            m.createdTimestamp > msg.createdTimestamp
           );
-          if (laterMessages.size > 0) continue;
+          if (directReply) continue;
 
           // Check if already answered in DB
           const { data: existing } = await supabase.from('discord_messages')
@@ -1046,8 +1050,8 @@ async function catchUpUnanswered() {
             .single();
           if (existing?.is_answered) continue;
 
-          // Rate limit check
-          if (isAutoReplyRateLimited(guild.id)) break;
+          // Rate limit check (skip during catchup)
+          if (!isCatchingUp && isAutoReplyRateLimited(guild.id)) break;
 
           // Generate and send reply
           const reply = await generateAutoReply(msg, brandCtx);
@@ -1103,6 +1107,7 @@ async function catchUpUnanswered() {
     }
   }
 
+  isCatchingUp = false;
   if (totalCaughtUp > 0) {
     console.log(`[Catchup] Replied to ${totalCaughtUp} unanswered message(s) across all servers`);
   } else {
