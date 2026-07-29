@@ -46,6 +46,12 @@ const hubSupabase = (process.env.HUB_SUPABASE_URL && process.env.HUB_SUPABASE_KE
 const STATIC_BRAND_CONTEXTS = JSON.parse(readFileSync(path.join(__dirname, 'brand-contexts.json'), 'utf8'));
 const STATIC_DEFAULT = STATIC_BRAND_CONTEXTS._default;
 
+// TikTok Shop knowledge base — loaded into conversational prompts
+const TIKTOK_KNOWLEDGE = JSON.parse(readFileSync(path.join(__dirname, 'tiktok-knowledge.json'), 'utf8'));
+const TIKTOK_KNOWLEDGE_TEXT = Object.entries(TIKTOK_KNOWLEDGE)
+  .map(([category, items]) => `${category.replace(/_/g, ' ').toUpperCase()}:\n${items.map(i => `- ${i}`).join('\n')}`)
+  .join('\n\n');
+
 // Mutable cache — updated by DB poll
 let defaultBotConfig = { ...STATIC_DEFAULT };
 let botConfigCache = new Map(); // discord_server_id → config object
@@ -897,6 +903,8 @@ CRITICAL STYLE RULES:
 - If you recognise a returning member, don't treat them like a stranger. A casual "hey again" vibe is fine.
 - Never say you're an AI or bot. You ARE Alice, part of the team.`;
 
+  const tiktokKnowledge = isConversational ? `\n\nTikTok Shop Knowledge (use when relevant, don't dump info unprompted):\n${TIKTOK_KNOWLEDGE_TEXT}` : '';
+
   const systemPrompt = `You are ${isConversational ? 'Alice, a friendly team member at' : 'replying as'} ${brandCtx.brandName || 'the brand'} in a Discord community server${isConversational ? '' : ' for creators and affiliates'}.
 
 Brand voice: ${brandCtx.brandVoice || defaultBotConfig.brandVoice}
@@ -905,12 +913,15 @@ Brand context:
 ${contextInfo}
 
 Known FAQ:
-${faqEntries}
+${faqEntries}${tiktokKnowledge}
 
 ${isConversational ? conversationalRules : questionOnlyRules}`;
 
+  // Include learned FAQ from team answers
+  const learnedFAQText = isConversational ? getLearnedFAQText(message.guild.id) : '';
+
   // Build enhanced user message with all context
-  const userContent = `Discord message from ${message.author.displayName || message.author.username} in #${message.channel.name}:\n\n${message.content}${mediaInfo}${conversationContext}${memberMemory}`;
+  const userContent = `Discord message from ${message.author.displayName || message.author.username} in #${message.channel.name}:\n\n${message.content}${mediaInfo}${conversationContext}${memberMemory}${learnedFAQText}`;
 
   try {
     const response = await anthropic.messages.create({
@@ -1223,6 +1234,451 @@ function scheduleEngagement() {
   console.log(`Scheduled ${ENGAGEMENT_SCHEDULE.length} weekly engagement posts`);
 }
 
+// ── Sentiment Detection — fast-track alert for frustrated members ─────────────
+const FRUSTRATED_PATTERNS = [
+  /\b(frustrated|annoyed|pissed|angry|furious|upset|disappointed|fed up)\b/i,
+  /\b(this is ridiculous|this is bs|what the hell|wtf|so annoying|sick of this)\b/i,
+  /\b(no one (responds?|replies|helps?|answers?))\b/i,
+  /\b(worst (experience|service|support))\b/i,
+  /\b(been waiting (forever|weeks|days|ages))\b/i,
+  /\b(waste of time|scam|rip ?off|don'?t bother)\b/i,
+];
+
+function detectSentiment(message) {
+  const content = message.content || '';
+  for (const pattern of FRUSTRATED_PATTERNS) {
+    if (pattern.test(content)) return 'frustrated';
+  }
+  return null;
+}
+
+async function handleNegativeSentiment(message, sentiment) {
+  console.log(`[Sentiment] ${sentiment} detected from ${message.author.username} in #${message.channel.name}`);
+  await slackAlert(`:warning: Negative sentiment in ${message.guild.name}`, [
+    { type: 'header', text: { type: 'plain_text', text: `${sentiment.toUpperCase()} member detected` } },
+    { type: 'section', text: { type: 'mrkdwn',
+      text: `*#${message.channel.name}* — *${message.author.username}*\n>${message.content.substring(0, 400)}` } },
+    { type: 'section', text: { type: 'mrkdwn',
+      text: `:point_right: <${message.url}|Jump to message> — someone should respond ASAP` } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: ':brain: Automated sentiment detection — may be a false positive' }] },
+  ]);
+}
+
+// ── Win Detection — celebrate achievements ───────────────────────────────────
+const WIN_PATTERNS = [
+  /\b(first (sale|order)|got my first)\b/i,
+  /\b(went viral|blew up|over \d+k views)\b/i,
+  /\b(hit \d+k? (followers|views|sales|orders))\b/i,
+  /\b(made \$\d+|earned \$\d+)\b/i,
+  /\b(best.selling|top seller|number one)\b/i,
+  /\b(got approved|got accepted|got the retainer)\b/i,
+  /\b(so excited|can't believe|omg.*sold)\b/i,
+];
+
+const WIN_REACTIONS = ['🔥', '🎉', '💪', '🙌', '🥳', '💯'];
+
+function detectWin(message) {
+  const content = message.content || '';
+  for (const pattern of WIN_PATTERNS) {
+    if (pattern.test(content)) return true;
+  }
+  return false;
+}
+
+async function celebrateWin(message) {
+  try {
+    // Add a celebration reaction
+    const emoji = WIN_REACTIONS[Math.floor(Math.random() * WIN_REACTIONS.length)];
+    await message.react(emoji);
+    console.log(`[Win] Celebrated ${message.author.username}'s win in #${message.channel.name}`);
+  } catch (err) {
+    console.error('[Win] React error:', err.message);
+  }
+}
+
+// ── FAQ Learning — track team answers for Alice to learn from ────────────────
+const learnedFAQ = new Map(); // serverId → [{ question, answer, channel }]
+const MAX_LEARNED_FAQ = 20; // keep last 20 per server
+
+function trackTeamAnswer(teamMessage, originalQuestion) {
+  if (!originalQuestion || !teamMessage.content) return;
+  const serverId = teamMessage.guild.id;
+  if (!learnedFAQ.has(serverId)) learnedFAQ.set(serverId, []);
+  const faqs = learnedFAQ.get(serverId);
+  faqs.push({
+    question: originalQuestion.substring(0, 200),
+    answer: teamMessage.content.substring(0, 300),
+    channel: teamMessage.channel.name,
+    timestamp: Date.now(),
+  });
+  // Keep only the most recent entries
+  while (faqs.length > MAX_LEARNED_FAQ) faqs.shift();
+}
+
+function getLearnedFAQText(serverId) {
+  const faqs = learnedFAQ.get(serverId);
+  if (!faqs?.length) return '';
+  return '\n\nRecent team answers (learn from these):\n' +
+    faqs.slice(-10).map(f => `Q: ${f.question}\nA: ${f.answer}`).join('\n\n');
+}
+
+// ── Onboarding Drip — follow-up DMs on Day 3 and Day 7 ──────────────────────
+async function runOnboardingDrip() {
+  const now = Date.now();
+  const day3Ago = new Date(now - 3 * 86400000).toISOString().split('T')[0];
+  const day7Ago = new Date(now - 7 * 86400000).toISOString().split('T')[0];
+
+  for (const [, guild] of client.guilds.cache) {
+    const brandCtx = getBrandContext(guild.id);
+    if (!brandCtx.conversational) continue;
+
+    try {
+      // Get members who joined 3 days ago
+      const { data: day3Joins } = await supabase.from('discord_member_events')
+        .select('user_id, username')
+        .eq('discord_server_id', guild.id)
+        .eq('event_type', 'join')
+        .gte('created_at', day3Ago + 'T00:00:00Z')
+        .lte('created_at', day3Ago + 'T23:59:59Z');
+
+      for (const join of (day3Joins || [])) {
+        // Check if they've posted anything
+        const { data: messages } = await supabase.from('discord_messages')
+          .select('discord_message_id')
+          .eq('discord_server_id', guild.id)
+          .eq('author_id', join.user_id)
+          .limit(1);
+
+        if (!messages?.length) {
+          // They joined 3 days ago but haven't posted — send a nudge
+          try {
+            const member = await guild.members.fetch(join.user_id);
+            await member.send(`Hey! Just checking in since you joined ${guild.name} a few days ago. If you haven't already, drop an intro in #intro-yourself and check out #brand-deals for current opportunities. Let me know if you have any questions!`);
+            console.log(`[Onboarding] Day 3 nudge sent to ${join.username}`);
+            await slackAlert(`Alice Day 3 nudge DM in ${guild.name}`, [
+              { type: 'section', text: { type: 'mrkdwn', text: `*Member:* ${join.username}\n*Status:* Joined 3 days ago, hasn't posted yet` } },
+            ]);
+          } catch (_) {} // DMs might be disabled
+        }
+      }
+
+      // Get members who joined 7 days ago
+      const { data: day7Joins } = await supabase.from('discord_member_events')
+        .select('user_id, username')
+        .eq('discord_server_id', guild.id)
+        .eq('event_type', 'join')
+        .gte('created_at', day7Ago + 'T00:00:00Z')
+        .lte('created_at', day7Ago + 'T23:59:59Z');
+
+      for (const join of (day7Joins || [])) {
+        const { data: messages } = await supabase.from('discord_messages')
+          .select('discord_message_id')
+          .eq('discord_server_id', guild.id)
+          .eq('author_id', join.user_id)
+          .limit(1);
+
+        if (!messages?.length) {
+          try {
+            const member = await guild.members.fetch(join.user_id);
+            await member.send(`Hey! It's been about a week since you joined ${guild.name}. Just wanted to make sure you're not missing out — we post creator opportunities and retainer deals in #brand-deals and #announcements regularly. Feel free to jump in anytime!`);
+            console.log(`[Onboarding] Day 7 nudge sent to ${join.username}`);
+            await slackAlert(`Alice Day 7 nudge DM in ${guild.name}`, [
+              { type: 'section', text: { type: 'mrkdwn', text: `*Member:* ${join.username}\n*Status:* Joined 7 days ago, still hasn't posted` } },
+            ]);
+          } catch (_) {}
+        }
+      }
+    } catch (err) {
+      console.error(`[Onboarding] Error for ${guild.name}:`, err.message);
+    }
+  }
+}
+
+// ── Content Nudge — DM creators who go quiet for 2+ weeks ────────────────────
+async function runContentNudges() {
+  const twoWeeksAgo = new Date(Date.now() - 14 * 86400000).toISOString();
+  const fourWeeksAgo = new Date(Date.now() - 28 * 86400000).toISOString();
+
+  for (const [, guild] of client.guilds.cache) {
+    const brandCtx = getBrandContext(guild.id);
+    if (!brandCtx.conversational) continue;
+
+    try {
+      // Find users who were active in the last month but haven't posted in 2+ weeks
+      const { data: recentlyActive } = await supabase.from('discord_messages')
+        .select('author_id, author_name')
+        .eq('discord_server_id', guild.id)
+        .eq('is_team_member', false)
+        .gte('created_at', fourWeeksAgo)
+        .lte('created_at', twoWeeksAgo);
+
+      if (!recentlyActive?.length) continue;
+
+      // Deduplicate by author
+      const uniqueAuthors = new Map();
+      for (const msg of recentlyActive) {
+        if (!uniqueAuthors.has(msg.author_id)) uniqueAuthors.set(msg.author_id, msg.author_name);
+      }
+
+      for (const [authorId, authorName] of uniqueAuthors) {
+        // Check they haven't posted recently
+        const { data: recent } = await supabase.from('discord_messages')
+          .select('discord_message_id')
+          .eq('discord_server_id', guild.id)
+          .eq('author_id', authorId)
+          .gte('created_at', twoWeeksAgo)
+          .limit(1);
+
+        if (recent?.length) continue; // still active
+
+        // Check we haven't already nudged them (avoid spamming)
+        const { data: recentNudge } = await supabase.from('discord_nudges')
+          .select('id')
+          .eq('discord_server_id', guild.id)
+          .eq('user_id', authorId)
+          .gte('created_at', fourWeeksAgo)
+          .limit(1);
+        if (recentNudge?.length) continue; // already nudged recently
+
+        try {
+          const member = await guild.members.fetch(authorId);
+          const templates = [
+            `Hey ${authorName}! Haven't seen you around in ${guild.name} for a bit. Hope everything's going well! We've got some new opportunities in #brand-deals if you're looking to get back into creating.`,
+            `Hey! Just noticed you've been quiet in ${guild.name} lately. No pressure at all, just wanted to check in. There's some cool stuff happening in #announcements if you want to take a look!`,
+          ];
+          const dmText = templates[Math.floor(Math.random() * templates.length)];
+          await member.send(dmText);
+          console.log(`[Nudge] Sent content nudge to ${authorName}`);
+
+          // Track the nudge to avoid repeat DMs
+          await supabase.from('discord_nudges').insert({
+            discord_server_id: guild.id,
+            user_id: authorId,
+            username: authorName,
+            nudge_type: 'content_inactive',
+          }).catch(() => {}); // table might not exist yet, that's ok
+
+          await slackAlert(`Alice nudge DM in ${guild.name}`, [
+            { type: 'section', text: { type: 'mrkdwn', text: `*Member:* ${authorName}\n*Reason:* Inactive for 2+ weeks\n*DM:* ${dmText}` } },
+          ]);
+        } catch (_) {} // member may have left or DMs disabled
+      }
+    } catch (err) {
+      console.error(`[Nudge] Error for ${guild.name}:`, err.message);
+    }
+  }
+}
+
+// ── Auto-Role Assignment — reward active members ─────────────────────────────
+const ROLE_THRESHOLDS = [
+  { minMessages: 50, roleName: 'Top Contributor', color: '#FFD700' },
+  { minMessages: 15, roleName: 'Active Creator', color: '#10B981' },
+];
+
+async function runAutoRoles() {
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString();
+
+  for (const [, guild] of client.guilds.cache) {
+    const brandCtx = getBrandContext(guild.id);
+    if (!brandCtx.conversational) continue;
+    if (!guild.members.me?.permissions.has('ManageRoles')) {
+      console.log(`[AutoRole] Missing ManageRoles permission in ${guild.name}`);
+      continue;
+    }
+
+    try {
+      // Count messages per non-team author in last 30 days
+      const { data: msgCounts } = await supabase.from('discord_messages')
+        .select('author_id, author_name')
+        .eq('discord_server_id', guild.id)
+        .eq('is_team_member', false)
+        .gte('created_at', thirtyDaysAgo);
+
+      if (!msgCounts?.length) continue;
+
+      const counts = {};
+      for (const msg of msgCounts) {
+        counts[msg.author_id] = (counts[msg.author_id] || 0) + 1;
+      }
+
+      for (const [authorId, count] of Object.entries(counts)) {
+        // Find the highest threshold they qualify for
+        const qualifiedRole = ROLE_THRESHOLDS.find(t => count >= t.minMessages);
+        if (!qualifiedRole) continue;
+
+        try {
+          const member = await guild.members.fetch(authorId);
+          // Check if they already have the role
+          const existingRole = guild.roles.cache.find(r => r.name === qualifiedRole.roleName);
+          if (existingRole && member.roles.cache.has(existingRole.id)) continue; // already has it
+
+          // Create role if it doesn't exist
+          let role = existingRole;
+          if (!role) {
+            role = await guild.roles.create({
+              name: qualifiedRole.roleName,
+              color: qualifiedRole.color,
+              reason: 'Auto-role for active community members',
+            });
+            console.log(`[AutoRole] Created role "${qualifiedRole.roleName}" in ${guild.name}`);
+          }
+
+          // Assign the role
+          await member.roles.add(role);
+          console.log(`[AutoRole] Assigned "${qualifiedRole.roleName}" to ${member.user.username} (${count} msgs)`);
+        } catch (err) {
+          console.error(`[AutoRole] Error assigning to ${authorId}:`, err.message);
+        }
+      }
+    } catch (err) {
+      console.error(`[AutoRole] Error for ${guild.name}:`, err.message);
+    }
+  }
+}
+
+// ── Creator Spotlight — weekly shoutout to top creator ────────────────────────
+async function postCreatorSpotlight() {
+  if (!hubSupabase) return;
+
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
+
+  for (const [, guild] of client.guilds.cache) {
+    const brandCtx = getBrandContext(guild.id);
+
+    try {
+      // Look up brand in Hub
+      const { data: brand } = await hubSupabase
+        .from('brands')
+        .select('id, name')
+        .eq('discord_server_id', guild.id)
+        .single();
+      if (!brand) continue;
+
+      // Get top creator by views in last 30 days
+      const { data: topCreators } = await hubSupabase
+        .from('creator_videos')
+        .select('tiktok_account, views, gmv, orders')
+        .eq('brand_id', brand.id)
+        .gte('post_date', thirtyDaysAgo)
+        .order('views', { ascending: false })
+        .limit(20);
+
+      if (!topCreators?.length) continue;
+
+      // Aggregate by creator
+      const creatorStats = {};
+      for (const v of topCreators) {
+        if (!v.tiktok_account) continue;
+        if (!creatorStats[v.tiktok_account]) {
+          creatorStats[v.tiktok_account] = { views: 0, gmv: 0, orders: 0, videos: 0 };
+        }
+        const s = creatorStats[v.tiktok_account];
+        s.views += v.views || 0;
+        s.gmv += v.gmv || 0;
+        s.orders += v.orders || 0;
+        s.videos++;
+      }
+
+      // Find top creator
+      const sorted = Object.entries(creatorStats).sort((a, b) => b[1].views - a[1].views);
+      if (!sorted.length) continue;
+
+      const [topHandle, stats] = sorted[0];
+
+      // Find a suitable channel to post in
+      const textChannels = guild.channels.cache.filter(c => c.type === 0);
+      const target = textChannels.find(c => c.name.includes('community') && c.name.includes('chat'))
+        || textChannels.find(c => c.name.includes('announcement'))
+        || textChannels.find(c => c.name.includes('general'));
+      if (!target) continue;
+
+      const spotlightMsg = `Creator Spotlight this week goes to @${topHandle}! ${formatViews(stats.views)} total views across ${stats.videos} video${stats.videos > 1 ? 's' : ''} this month${stats.orders > 0 ? ` and ${stats.orders} orders` : ''}. Keep crushing it! 🔥`;
+
+      if (brandCtx.conversational) {
+        await target.send(spotlightMsg);
+      } else {
+        const webhook = await getOrCreateWebhook(target, brandCtx.brandName || guild.name);
+        if (webhook) {
+          await webhook.send({
+            content: spotlightMsg,
+            username: brandCtx.brandName || guild.name,
+            avatarURL: guild.iconURL({ size: 128 }),
+          });
+        }
+      }
+
+      console.log(`[Spotlight] Posted creator spotlight for @${topHandle} in ${guild.name}`);
+    } catch (err) {
+      console.error(`[Spotlight] Error for ${guild.name}:`, err.message);
+    }
+  }
+}
+
+// ── Milestone Celebrations — detect first viral video, big sales, etc. ───────
+async function checkMilestones() {
+  if (!hubSupabase) return;
+
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+
+  for (const [, guild] of client.guilds.cache) {
+    const brandCtx = getBrandContext(guild.id);
+
+    try {
+      const { data: brand } = await hubSupabase
+        .from('brands')
+        .select('id, name')
+        .eq('discord_server_id', guild.id)
+        .single();
+      if (!brand) continue;
+
+      // Check for viral videos (10K+ views) posted yesterday
+      const { data: viralVideos } = await hubSupabase
+        .from('creator_videos')
+        .select('tiktok_account, views, video_url')
+        .eq('brand_id', brand.id)
+        .eq('post_date', yesterday)
+        .gte('views', 10000)
+        .order('views', { ascending: false })
+        .limit(5);
+
+      if (!viralVideos?.length) continue;
+
+      const textChannels = guild.channels.cache.filter(c => c.type === 0);
+      const target = textChannels.find(c => c.name.includes('community') && c.name.includes('chat'))
+        || textChannels.find(c => c.name.includes('announcement'))
+        || textChannels.find(c => c.name.includes('general') || c.name.includes('chat'));
+      if (!target) continue;
+
+      for (const video of viralVideos) {
+        const handle = video.tiktok_account ? `@${video.tiktok_account}` : 'One of our creators';
+        const msg = `${handle} just hit ${formatViews(video.views)} views! 🎉${video.video_url ? ` Check it out: ${video.video_url}` : ''} Amazing work!`;
+
+        if (brandCtx.conversational) {
+          await target.send(msg);
+        } else {
+          const webhook = await getOrCreateWebhook(target, brandCtx.brandName || guild.name);
+          if (webhook) {
+            await webhook.send({ content: msg, username: brandCtx.brandName || guild.name, avatarURL: guild.iconURL({ size: 128 }) });
+          }
+        }
+        console.log(`[Milestone] Celebrated ${handle} hitting ${formatViews(video.views)} views in ${guild.name}`);
+      }
+    } catch (err) {
+      console.error(`[Milestone] Error for ${guild.name}:`, err.message);
+    }
+  }
+}
+
+// ── Daily Member Checks — runs once per day, handles drip + nudges + roles ───
+async function dailyMemberChecks() {
+  console.log('[Daily] Running member checks...');
+  await runOnboardingDrip().catch(err => console.error('[Daily] Onboarding error:', err.message));
+  await runContentNudges().catch(err => console.error('[Daily] Nudge error:', err.message));
+  await runAutoRoles().catch(err => console.error('[Daily] AutoRole error:', err.message));
+  await checkMilestones().catch(err => console.error('[Daily] Milestone error:', err.message));
+  console.log('[Daily] Member checks complete');
+}
+
 // ── Startup Catchup — reply to recent unanswered messages ────────────────────
 let isCatchingUp = false; // bypass rate limit during catchup
 
@@ -1437,6 +1893,12 @@ client.on('ready', async () => {
 
   // Engagement posts — Mon/Tue/Wed/Thu/Fri conversation starters
   scheduleEngagement();
+
+  // Daily member checks at 10:00 — onboarding drip, content nudges, auto-roles, milestones
+  scheduleDaily(10, 0, dailyMemberChecks);
+
+  // Weekly creator spotlight — Wednesday at 11:00
+  scheduleWeekly(3, 11, 0, postCreatorSpotlight);
 });
 
 // Auto-onboard new servers
@@ -1505,11 +1967,31 @@ client.on('messageCreate', async (message) => {
         if (info.channelId === message.channel.id) cancelAutoReply(msgId);
       }
     }
-    if (message.reference?.messageId) cancelAutoReply(message.reference.messageId);
+    if (message.reference?.messageId) {
+      cancelAutoReply(message.reference.messageId);
+      // FAQ learning — track team answers to community questions
+      try {
+        const originalMsg = await message.channel.messages.fetch(message.reference.messageId);
+        if (originalMsg && !originalMsg.author.bot && originalMsg.content?.includes('?')) {
+          trackTeamAnswer(message, originalMsg.content);
+        }
+      } catch (_) {} // original message might be deleted
+    }
     await markAsAnswered(message);
   } else {
     // Community message — schedule auto-reply after delay
     scheduleAutoReply(message);
+
+    // Win detection — celebrate achievements
+    if (detectWin(message)) {
+      await celebrateWin(message);
+    }
+
+    // Sentiment detection — fast-track alert for frustrated members
+    const sentiment = detectSentiment(message);
+    if (sentiment) {
+      await handleNegativeSentiment(message, sentiment);
+    }
   }
 });
 
