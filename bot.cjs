@@ -907,6 +907,90 @@ function cancelAutoReply(messageId) {
   }
 }
 
+// ── Scheduled Engagement Posts (conversational servers only) ──────────────────
+const ENGAGEMENT_SCHEDULE = [
+  // { day: 0-6 (Sun-Sat), hour: 0-23 (UTC), type: prompt category }
+  { day: 1, hour: 10, type: 'monday_checkin' },    // Monday 10am — weekend recap
+  { day: 2, hour: 14, type: 'conversation' },       // Tuesday 2pm — general convo
+  { day: 3, hour: 11, type: 'tiktok_topic' },       // Wednesday 11am — TikTok Shop topic
+  { day: 4, hour: 15, type: 'conversation' },       // Thursday 3pm — general convo
+  { day: 5, hour: 10, type: 'friday_weekend' },     // Friday 10am — weekend plans
+];
+
+const ENGAGEMENT_PROMPTS = {
+  monday_checkin: [
+    "Hope everyone had a great weekend! Anyone do anything fun? I spent mine catching up on TikTok trends 👀",
+    "Happy Monday! How was everyone's weekend? Did anyone post any content over the weekend?",
+    "Monday check-in! How's everyone feeling about the week ahead? Anyone got big content plans?",
+    "Hey everyone! Hope the weekend treated you well — who's feeling motivated to crush it this week?",
+    "Monday vibes! Anyone try any new content ideas over the weekend? Would love to hear what you've been working on",
+  ],
+  friday_weekend: [
+    "Happy Friday! Who's planning to batch some content this weekend? What brands are you working on?",
+    "It's Friday! Anyone going live this weekend? Drop your plans below 👇",
+    "Weekend's almost here! What's everyone's content plan? Batch filming, going live, or taking a well-earned break?",
+    "TGIF! Who's got posting plans this weekend? Always love seeing what everyone's working on",
+    "Friday check-in! What was your biggest win this week? And who's creating content this weekend?",
+  ],
+  tiktok_topic: [
+    "Quick question — what's been your best-performing video format lately? Short and snappy or longer storytelling?",
+    "Been seeing a lot of creators crush it with behind-the-scenes content lately. Is anyone here doing BTS style videos?",
+    "What's one thing you've learned about TikTok Shop that you wish you knew when you started?",
+    "Live selling vs short-form videos — which one's been working better for you guys lately?",
+    "Hot topic: what product categories do you think are about to blow up on TikTok Shop? I've got some thoughts but want to hear yours first 👀",
+    "Anyone experimenting with different posting times? Curious what's been working for people",
+    "What's your go-to hook for TikTok videos? The first 2 seconds make or break a video honestly",
+    "Real talk — what's the hardest part about creating content for TikTok Shop? Let's problem-solve together",
+  ],
+  conversation: [
+    "Random thought — what got you into content creation in the first place? Everyone's got a different story",
+    "What's everyone watching/listening to at the moment? Always looking for new podcast or show recommendations",
+    "If you could promote any brand on TikTok, dream brand with no limits, who would it be and why?",
+    "Alright, fun one — what's the most unexpected product you've seen go viral on TikTok?",
+    "How do you guys stay creative when you're not feeling it? Would love to hear everyone's tips",
+    "What's your setup like for filming? Phone on a stack of books gang or full studio setup? No judgement either way 😂",
+    "Anyone here juggling content creation with a full-time job or parenting? How do you manage your time?",
+    "What's one goal you're working towards right now? Could be content-related or just life in general",
+  ],
+};
+
+async function postEngagementMessage(type) {
+  const prompts = ENGAGEMENT_PROMPTS[type];
+  if (!prompts?.length) return;
+
+  // Pick a random prompt from the category
+  const message = prompts[Math.floor(Math.random() * prompts.length)];
+
+  for (const [, guild] of client.guilds.cache) {
+    const brandCtx = getBrandContext(guild.id);
+    if (!brandCtx.conversational) continue; // only post in conversational servers
+
+    // Find community-chat or general channel
+    const textChannels = guild.channels.cache.filter(c => c.type === 0);
+    const target = textChannels.find(c => c.name.includes('community') && c.name.includes('chat'))
+      || textChannels.find(c => c.name.includes('general') && !c.name.includes('alert'))
+      || textChannels.find(c => c.name.includes('chat') && !c.name.includes('alert') && !c.name.includes('team'));
+
+    if (!target) continue;
+    if (!target.permissionsFor(client.user)?.has(['ViewChannel', 'SendMessages'])) continue;
+
+    try {
+      // Post as Alice (directly, not via webhook — she's a community member)
+      await target.send(message);
+      console.log(`[Engagement] Posted ${type} in #${target.name} (${guild.name}): ${message.substring(0, 60)}...`);
+    } catch (err) {
+      console.error(`[Engagement] Error posting in ${guild.name}:`, err.message);
+    }
+  }
+}
+
+function scheduleEngagement() {
+  for (const slot of ENGAGEMENT_SCHEDULE) {
+    scheduleWeekly(slot.day, slot.hour, 0, () => postEngagementMessage(slot.type));
+  }
+  console.log(`Scheduled ${ENGAGEMENT_SCHEDULE.length} weekly engagement posts`);
+}
+
 // ── Startup Catchup — reply to recent unanswered messages ────────────────────
 async function catchUpUnanswered() {
   const CATCHUP_HOURS = 4; // only look back this far
@@ -1047,6 +1131,9 @@ client.on('ready', async () => {
 
   // Weekly content inspiration — Monday at 10:00
   scheduleWeekly(1, 10, 0, postWeeklyInspiration);
+
+  // Engagement posts — Mon/Tue/Wed/Thu/Fri conversation starters
+  scheduleEngagement();
 });
 
 // Auto-onboard new servers
