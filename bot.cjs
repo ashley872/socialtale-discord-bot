@@ -1798,9 +1798,8 @@ async function catchUpUnanswered() {
               continue;
             }
 
-            // Lowercase first char + strip em dashes for conversational servers
+            // Strip em dashes for conversational servers
             let cleanReply = reply.replace(/—/g, ',').replace(/–/g, ',');
-            if (brandCtx.conversational) cleanReply = lowercaseFirst(cleanReply);
 
             // In conversational servers, reply directly as Alice (not via webhook)
             if (brandCtx.conversational) {
