@@ -117,6 +117,45 @@ async function slackAlert(text, blocks) {
 const pendingMessages = new Map();  // serverId → Map<messageId, info>
 const dailyActiveUsers = new Map(); // serverId → Set<authorId>
 const webhookCache = new Map();     // channelId → Webhook
+const channelReplyStreak = new Map(); // channelId → number of consecutive Alice replies
+
+// ── Reactions & Mixing ──────────────────────────────────────────────────────
+const REACTION_EMOJIS = {
+  intro: ['👋', '🙌', '🤗'],
+  achievement: ['🔥', '🎉', '💪', '🙌'],
+  question: ['👀', '🤔'],
+  positive: ['❤️', '💯', '✨'],
+  general: ['👍', '💯', '❤️', '🔥', '✨'],
+};
+
+function pickReaction(content) {
+  const lower = content.toLowerCase();
+  if (/new here|just joined|hey everyone|hi everyone|my name is|i'm new|i am new|intro/.test(lower)) {
+    const pool = REACTION_EMOJIS.intro;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+  if (/sale|first order|went viral|views|milestone|sold|commission|made \$|earned/.test(lower)) {
+    const pool = REACTION_EMOJIS.achievement;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+  if (lower.includes('?')) {
+    const pool = REACTION_EMOJIS.question;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+  if (/love|thank|excited|happy|great|yay|woohoo|can't wait/.test(lower)) {
+    const pool = REACTION_EMOJIS.positive;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+  const pool = REACTION_EMOJIS.general;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function lowercaseFirst(text) {
+  if (!text) return text;
+  // Don't lowercase "I " or "I'" (I'm, I've etc)
+  if (/^I[\s']/.test(text)) return text;
+  return text[0].toLowerCase() + text.slice(1);
+}
 
 // ── Discord Client ──────────────────────────────────────────────────────────
 const client = new Client({
@@ -809,6 +848,7 @@ CRITICAL STYLE RULES:
 - Ask short natural questions like "what kind of stuff do you post?" or "how long have you been on tiktok?" not formal questions.
 - If someone asks about retainers, just say we're always running them and to check #brand-deals and #announcements.
 - Match the energy. If someone writes one word, don't write four sentences back.
+- Start messages with lowercase. never capitalise the first word unless it's "I" or a proper noun. this is discord, not an email.
 - Never say you're an AI or bot. You ARE Alice, part of the team.`;
 
   const systemPrompt = `You are ${isConversational ? 'Alice, a friendly team member at' : 'replying as'} ${brandCtx.brandName || 'the brand'} in a Discord community server${isConversational ? '' : ' for creators and affiliates'}.
@@ -862,27 +902,62 @@ function scheduleAutoReply(message) {
     // Rate limit check
     if (isAutoReplyRateLimited(message.guild.id)) return;
 
+    // Smart mixing: after consecutive replies in same channel, sometimes just react
+    const streak = channelReplyStreak.get(message.channel.id) || 0;
+    const reactOnly = brandCtx.conversational && streak >= 2 && Math.random() < 0.6;
+
+    if (reactOnly) {
+      // React-only — add emoji, skip text reply
+      try {
+        const emoji = pickReaction(message.content);
+        await message.react(emoji);
+        console.log(`React-only in #${message.channel.name}: ${emoji} on "${message.content.substring(0, 40)}"`);
+      } catch (e) { console.error('React error:', e.message); }
+      channelReplyStreak.set(message.channel.id, 0); // reset streak
+      // Mark as answered
+      if (serverPending) serverPending.delete(message.id);
+      await supabase.from('discord_messages')
+        .update({
+          is_answered: true,
+          replied_at: new Date().toISOString(),
+          replied_by: 'auto-react',
+          reply_time_seconds: Math.floor(delayMs / 1000),
+        })
+        .eq('discord_message_id', message.id)
+        .eq('discord_server_id', message.guild.id);
+      return;
+    }
+
     // Generate reply
     const reply = await generateAutoReply(message, brandCtx);
     if (!reply) return;
 
+    // Lowercase first char + strip em dashes for conversational servers
+    let cleanReply = reply.replace(/—/g, ',').replace(/–/g, ',');
+    if (brandCtx.conversational) cleanReply = lowercaseFirst(cleanReply);
+
     // In conversational servers, reply directly as Alice. In brand servers, use webhook.
     if (brandCtx.conversational) {
-      await message.reply(reply);
+      await message.reply(cleanReply);
+      // Sometimes also add a reaction alongside the reply (30% chance)
+      if (Math.random() < 0.3) {
+        try { await message.react(pickReaction(message.content)); } catch (_) {}
+      }
     } else {
       const mention = `<@${message.author.id}>`;
       const webhook = await getOrCreateWebhook(message.channel, brandCtx.brandName || message.guild.name);
       if (webhook) {
         await webhook.send({
-          content: `${mention} ${reply}`,
+          content: `${mention} ${cleanReply}`,
           username: brandCtx.brandName || message.guild.name,
           avatarURL: message.guild.iconURL({ size: 128 }),
         });
       } else {
-        await message.reply(reply);
+        await message.reply(cleanReply);
       }
     }
 
+    channelReplyStreak.set(message.channel.id, streak + 1);
     incrementAutoReplyCount(message.guild.id);
 
     // Mark as answered
@@ -897,12 +972,12 @@ function scheduleAutoReply(message) {
       .eq('discord_message_id', message.id)
       .eq('discord_server_id', message.guild.id);
 
-    console.log(`Auto-replied in #${message.channel.name} (${message.guild.name}): ${reply.substring(0, 80)}...`);
+    console.log(`Auto-replied in #${message.channel.name} (${message.guild.name}): ${cleanReply.substring(0, 80)}...`);
 
     // Notify Slack that bot auto-replied
     await slackAlert(`Auto-replied in ${message.guild.name} Discord`, [
       { type: 'section', text: { type: 'mrkdwn',
-        text: `*#${message.channel.name}* — ${message.author.username} asked:\n>${message.content.substring(0, 200)}\n\n*Bot replied:*\n${reply}` } },
+        text: `*#${message.channel.name}* — ${message.author.username} asked:\n>${message.content.substring(0, 200)}\n\n*Bot replied:*\n${cleanReply}` } },
       { type: 'context', elements: [{ type: 'mrkdwn', text: ':robot_face: Auto-reply after ' + (delayMs / 60000) + 'min — check if response is accurate' }] },
     ]);
   }, delayMs);
@@ -1076,6 +1151,37 @@ async function catchUpUnanswered() {
             // Rate limit check (skip during catchup)
             if (!isCatchingUp && isAutoReplyRateLimited(guild.id)) break;
 
+            // Smart mixing during catchup: after 2+ consecutive replies, sometimes just react
+            const cStreak = channelReplyStreak.get(channel.id) || 0;
+            const reactOnlyCatchup = brandCtx.conversational && cStreak >= 2 && Math.random() < 0.6;
+
+            if (reactOnlyCatchup) {
+              try {
+                const emoji = pickReaction(msg.content);
+                await msg.react(emoji);
+                console.log(`[Catchup] React-only in #${channel.name}: ${emoji} on "${msg.content.substring(0, 40)}"`);
+              } catch (e) { console.error('[Catchup] React error:', e.message); }
+              channelReplyStreak.set(channel.id, 0);
+              await supabase.from('discord_messages').upsert({
+                discord_message_id: msg.id,
+                discord_server_id: guild.id,
+                discord_channel_id: channel.id,
+                channel_name: channel.name,
+                author_id: msg.author.id,
+                author_name: msg.author.displayName || msg.author.username,
+                is_team_member: false,
+                content_preview: msg.content?.substring(0, 100) || '(no text)',
+                created_at: msg.createdAt.toISOString(),
+                is_answered: true,
+                replied_at: new Date().toISOString(),
+                replied_by: 'auto-react-catchup',
+                reply_time_seconds: Math.floor((Date.now() - msg.createdTimestamp) / 1000),
+              }, { onConflict: 'discord_message_id,discord_server_id' });
+              totalCaughtUp++;
+              await new Promise(r => setTimeout(r, 2000)); // short delay for reacts
+              continue;
+            }
+
             // Generate and send reply
             console.log(`[Catchup] Generating reply for ${msg.author.username} in #${channel.name}: "${msg.content.substring(0, 60)}"`);
             const reply = await generateAutoReply(msg, brandCtx);
@@ -1084,23 +1190,32 @@ async function catchUpUnanswered() {
               continue;
             }
 
+            // Lowercase first char + strip em dashes for conversational servers
+            let cleanReply = reply.replace(/—/g, ',').replace(/–/g, ',');
+            if (brandCtx.conversational) cleanReply = lowercaseFirst(cleanReply);
+
             // In conversational servers, reply directly as Alice (not via webhook)
             if (brandCtx.conversational) {
-              await msg.reply(reply);
+              await msg.reply(cleanReply);
+              // Sometimes also react alongside reply (30% chance)
+              if (Math.random() < 0.3) {
+                try { await msg.react(pickReaction(msg.content)); } catch (_) {}
+              }
             } else {
               const mention = `<@${msg.author.id}>`;
               const webhook = await getOrCreateWebhook(channel, brandCtx.brandName || guild.name);
               if (webhook) {
                 await webhook.send({
-                  content: `${mention} ${reply}`,
+                  content: `${mention} ${cleanReply}`,
                   username: brandCtx.brandName || guild.name,
                   avatarURL: guild.iconURL({ size: 128 }),
                 });
               } else {
-                await msg.reply(reply);
+                await msg.reply(cleanReply);
               }
             }
 
+            channelReplyStreak.set(channel.id, cStreak + 1);
             incrementAutoReplyCount(guild.id);
             totalCaughtUp++;
 
@@ -1121,12 +1236,12 @@ async function catchUpUnanswered() {
               reply_time_seconds: Math.floor((Date.now() - msg.createdTimestamp) / 1000),
             }, { onConflict: 'discord_message_id,discord_server_id' });
 
-            console.log(`[Catchup] Replied in #${channel.name} (${guild.name}): ${reply.substring(0, 80)}...`);
+            console.log(`[Catchup] Replied in #${channel.name} (${guild.name}): ${cleanReply.substring(0, 80)}...`);
 
             // Notify Slack
             await slackAlert(`Catchup auto-reply in ${guild.name} Discord`, [
               { type: 'section', text: { type: 'mrkdwn',
-                text: `*#${channel.name}* — ${msg.author.username} asked:\n>${msg.content.substring(0, 200)}\n\n*Bot replied:*\n${reply}` } },
+                text: `*#${channel.name}* — ${msg.author.username} asked:\n>${msg.content.substring(0, 200)}\n\n*Bot replied:*\n${cleanReply}` } },
               { type: 'context', elements: [{ type: 'mrkdwn', text: ':arrows_counterclockwise: Startup catchup — message was unanswered' }] },
             ]);
 
