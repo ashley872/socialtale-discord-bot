@@ -1035,96 +1035,101 @@ async function catchUpUnanswered() {
         console.log(`[Catchup] #${channel.name}: ${messages.size} fetched, ${recent.size} in window`);
 
         for (const [, msg] of recent) {
-          // Skip if from team
-          let memberObj = msg.member;
-          if (!memberObj) {
-            try { memberObj = await guild.members.fetch(msg.author.id); } catch (_) {}
-          }
-          if (isTeamMember(memberObj)) {
-            console.log(`[Catchup] Skipping team msg from ${msg.author.username}`);
-            continue;
-          }
-
-          // Only skip if someone directly replied to this specific message
-          const directReply = messages.find(m =>
-            m.reference?.messageId === msg.id &&
-            m.createdTimestamp > msg.createdTimestamp
-          );
-          if (directReply) {
-            console.log(`[Catchup] Skipping already-replied msg from ${msg.author.username}: "${msg.content.substring(0, 40)}"`);
-            continue;
-          }
-
-          // Check if already answered in DB
-          const { data: existing } = await supabase.from('discord_messages')
-            .select('is_answered')
-            .eq('discord_message_id', msg.id)
-            .eq('discord_server_id', guild.id)
-            .single();
-          if (existing?.is_answered) {
-            console.log(`[Catchup] Skipping DB-answered msg from ${msg.author.username}`);
-            continue;
-          }
-
-          // Rate limit check (skip during catchup)
-          if (!isCatchingUp && isAutoReplyRateLimited(guild.id)) break;
-
-          // Generate and send reply
-          console.log(`[Catchup] Generating reply for ${msg.author.username} in #${channel.name}: "${msg.content.substring(0, 60)}"`);
-          const reply = await generateAutoReply(msg, brandCtx);
-          if (!reply) {
-            console.log(`[Catchup] AI returned NO_REPLY for ${msg.author.username}: "${msg.content.substring(0, 60)}"`);
-            continue;
-          }
-
-          // In conversational servers, reply directly as Alice (not via webhook)
-          if (brandCtx.conversational) {
-            await msg.reply(reply);
-          } else {
-            const mention = `<@${msg.author.id}>`;
-            const webhook = await getOrCreateWebhook(channel, brandCtx.brandName || guild.name);
-            if (webhook) {
-              await webhook.send({
-                content: `${mention} ${reply}`,
-                username: brandCtx.brandName || guild.name,
-                avatarURL: guild.iconURL({ size: 128 }),
-              });
-            } else {
-              await msg.reply(reply);
+          try {
+            // Skip if from team
+            let memberObj = msg.member;
+            if (!memberObj) {
+              try { memberObj = await guild.members.fetch(msg.author.id); } catch (_) {}
             }
+            if (isTeamMember(memberObj)) {
+              console.log(`[Catchup] Skipping team msg from ${msg.author.username}`);
+              continue;
+            }
+
+            // Only skip if someone directly replied to this specific message
+            const directReply = messages.find(m =>
+              m.reference?.messageId === msg.id &&
+              m.createdTimestamp > msg.createdTimestamp
+            );
+            if (directReply) {
+              console.log(`[Catchup] Skipping already-replied msg from ${msg.author.username}: "${msg.content.substring(0, 40)}"`);
+              continue;
+            }
+
+            // Check if already answered in DB
+            const { data: existing } = await supabase.from('discord_messages')
+              .select('is_answered')
+              .eq('discord_message_id', msg.id)
+              .eq('discord_server_id', guild.id)
+              .single();
+            if (existing?.is_answered) {
+              console.log(`[Catchup] Skipping DB-answered msg from ${msg.author.username}`);
+              continue;
+            }
+
+            // Rate limit check (skip during catchup)
+            if (!isCatchingUp && isAutoReplyRateLimited(guild.id)) break;
+
+            // Generate and send reply
+            console.log(`[Catchup] Generating reply for ${msg.author.username} in #${channel.name}: "${msg.content.substring(0, 60)}"`);
+            const reply = await generateAutoReply(msg, brandCtx);
+            if (!reply) {
+              console.log(`[Catchup] AI returned NO_REPLY for ${msg.author.username}: "${msg.content.substring(0, 60)}"`);
+              continue;
+            }
+
+            // In conversational servers, reply directly as Alice (not via webhook)
+            if (brandCtx.conversational) {
+              await msg.reply(reply);
+            } else {
+              const mention = `<@${msg.author.id}>`;
+              const webhook = await getOrCreateWebhook(channel, brandCtx.brandName || guild.name);
+              if (webhook) {
+                await webhook.send({
+                  content: `${mention} ${reply}`,
+                  username: brandCtx.brandName || guild.name,
+                  avatarURL: guild.iconURL({ size: 128 }),
+                });
+              } else {
+                await msg.reply(reply);
+              }
+            }
+
+            incrementAutoReplyCount(guild.id);
+            totalCaughtUp++;
+
+            // Track in DB
+            await supabase.from('discord_messages').upsert({
+              discord_message_id: msg.id,
+              discord_server_id: guild.id,
+              discord_channel_id: channel.id,
+              channel_name: channel.name,
+              author_id: msg.author.id,
+              author_name: msg.author.displayName || msg.author.username,
+              is_team_member: false,
+              content_preview: msg.content?.substring(0, 100) || '(no text)',
+              created_at: msg.createdAt.toISOString(),
+              is_answered: true,
+              replied_at: new Date().toISOString(),
+              replied_by: 'auto-reply-catchup',
+              reply_time_seconds: Math.floor((Date.now() - msg.createdTimestamp) / 1000),
+            }, { onConflict: 'discord_message_id,discord_server_id' });
+
+            console.log(`[Catchup] Replied in #${channel.name} (${guild.name}): ${reply.substring(0, 80)}...`);
+
+            // Notify Slack
+            await slackAlert(`Catchup auto-reply in ${guild.name} Discord`, [
+              { type: 'section', text: { type: 'mrkdwn',
+                text: `*#${channel.name}* — ${msg.author.username} asked:\n>${msg.content.substring(0, 200)}\n\n*Bot replied:*\n${reply}` } },
+              { type: 'context', elements: [{ type: 'mrkdwn', text: ':arrows_counterclockwise: Startup catchup — message was unanswered' }] },
+            ]);
+
+            // Throttle to avoid flooding
+            await new Promise(r => setTimeout(r, CATCHUP_DELAY_MS));
+          } catch (msgErr) {
+            console.error(`[Catchup] Error on msg from ${msg.author.username}: ${msgErr.message}`);
+            // Continue to next message — don't let one failure kill the loop
           }
-
-          incrementAutoReplyCount(guild.id);
-          totalCaughtUp++;
-
-          // Track in DB
-          await supabase.from('discord_messages').upsert({
-            discord_message_id: msg.id,
-            discord_server_id: guild.id,
-            discord_channel_id: channel.id,
-            channel_name: channel.name,
-            author_id: msg.author.id,
-            author_name: msg.author.displayName || msg.author.username,
-            is_team_member: false,
-            content_preview: msg.content?.substring(0, 100) || '(no text)',
-            created_at: msg.createdAt.toISOString(),
-            is_answered: true,
-            replied_at: new Date().toISOString(),
-            replied_by: 'auto-reply-catchup',
-            reply_time_seconds: Math.floor((Date.now() - msg.createdTimestamp) / 1000),
-          }, { onConflict: 'discord_message_id,discord_server_id' });
-
-          console.log(`[Catchup] Replied in #${channel.name} (${guild.name}): ${reply.substring(0, 80)}...`);
-
-          // Notify Slack
-          await slackAlert(`Catchup auto-reply in ${guild.name} Discord`, [
-            { type: 'section', text: { type: 'mrkdwn',
-              text: `*#${channel.name}* — ${msg.author.username} asked:\n>${msg.content.substring(0, 200)}\n\n*Bot replied:*\n${reply}` } },
-            { type: 'context', elements: [{ type: 'mrkdwn', text: ':arrows_counterclockwise: Startup catchup — message was unanswered' }] },
-          ]);
-
-          // Throttle to avoid flooding
-          await new Promise(r => setTimeout(r, CATCHUP_DELAY_MS));
         }
       } catch (err) {
         console.error(`[Catchup] Error in #${channel.name} (${guild.name}):`, err.message);
