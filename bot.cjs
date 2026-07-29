@@ -150,12 +150,6 @@ function pickReaction(content) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
-function lowercaseFirst(text) {
-  if (!text) return text;
-  // Don't lowercase "I " or "I'" (I'm, I've etc)
-  if (/^I[\s']/.test(text)) return text;
-  return text[0].toLowerCase() + text.slice(1);
-}
 
 // ── Discord Client ──────────────────────────────────────────────────────────
 const client = new Client({
@@ -848,7 +842,6 @@ CRITICAL STYLE RULES:
 - Ask short natural questions like "what kind of stuff do you post?" or "how long have you been on tiktok?" not formal questions.
 - If someone asks about retainers, just say we're always running them and to check #brand-deals and #announcements.
 - Match the energy. If someone writes one word, don't write four sentences back.
-- Start messages with lowercase. never capitalise the first word unless it's "I" or a proper noun. this is discord, not an email.
 - Never say you're an AI or bot. You ARE Alice, part of the team.`;
 
   const systemPrompt = `You are ${isConversational ? 'Alice, a friendly team member at' : 'replying as'} ${brandCtx.brandName || 'the brand'} in a Discord community server${isConversational ? '' : ' for creators and affiliates'}.
@@ -932,9 +925,8 @@ function scheduleAutoReply(message) {
     const reply = await generateAutoReply(message, brandCtx);
     if (!reply) return;
 
-    // Lowercase first char + strip em dashes for conversational servers
+    // Strip em dashes
     let cleanReply = reply.replace(/—/g, ',').replace(/–/g, ',');
-    if (brandCtx.conversational) cleanReply = lowercaseFirst(cleanReply);
 
     // In conversational servers, reply directly as Alice. In brand servers, use webhook.
     if (brandCtx.conversational) {
