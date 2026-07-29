@@ -993,8 +993,9 @@ function scheduleEngagement() {
 
 // ── Startup Catchup — reply to recent unanswered messages ────────────────────
 async function catchUpUnanswered() {
-  const CATCHUP_HOURS = 4; // only look back this far
+  const CATCHUP_HOURS = parseInt(process.env.CATCHUP_HOURS || '4', 10); // default 4h, override via env
   const CATCHUP_DELAY_MS = 5000; // 5s between replies to avoid flooding
+  console.log(`[Catchup] Looking back ${CATCHUP_HOURS} hours`);
   const cutoff = new Date(Date.now() - CATCHUP_HOURS * 3600000);
   let totalCaughtUp = 0;
 
