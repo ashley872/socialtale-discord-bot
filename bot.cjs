@@ -814,6 +814,56 @@ async function generateAutoReply(message, brandCtx) {
 
   const isConversational = brandCtx.conversational === true;
 
+  // ── Fetch conversation context + member history in parallel ──
+  const [recentMsgs, authorHistoryResult] = await Promise.all([
+    message.channel.messages.fetch({ limit: 8, before: message.id }).catch(() => new Map()),
+    supabase.from('discord_messages')
+      .select('content_preview, channel_name, created_at')
+      .eq('discord_server_id', message.guild.id)
+      .eq('author_id', message.author.id)
+      .order('created_at', { ascending: false })
+      .limit(5),
+  ]);
+
+  // Build conversation context (recent messages in channel)
+  let conversationContext = '';
+  if (recentMsgs.size > 0) {
+    const sorted = [...recentMsgs.values()]
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+      .map(m => `${m.author.displayName || m.author.username}: ${m.content || '(attachment)'}`)
+      .join('\n');
+    conversationContext = `\n\nRecent conversation in this channel:\n${sorted}`;
+  }
+
+  // Build member memory context
+  let memberMemory = '';
+  const authorHistory = authorHistoryResult?.data || [];
+  if (authorHistory.length > 1) {
+    memberMemory = `\n\n[Note: You've chatted with ${message.author.displayName || message.author.username} before — they're a returning member, not new.]`;
+  } else if (authorHistory.length === 0) {
+    memberMemory = `\n\n[Note: This looks like ${message.author.displayName || message.author.username}'s first message in this server.]`;
+  }
+
+  // Media awareness
+  let mediaInfo = '';
+  if (message.attachments?.size > 0) {
+    const types = [...message.attachments.values()].map(a => {
+      if (a.contentType?.startsWith('image/')) return 'an image';
+      if (a.contentType?.startsWith('video/')) return 'a video';
+      return 'a file';
+    });
+    mediaInfo = `\n[They also shared ${types.join(' and ')}]`;
+  }
+  if (!mediaInfo && message.embeds?.length > 0) {
+    const embedTypes = message.embeds.map(e => {
+      if (e.video) return 'a video link';
+      if (e.url?.includes('tiktok')) return 'a TikTok link';
+      if (e.image) return 'an image link';
+      return 'a link';
+    });
+    if (embedTypes.length) mediaInfo = `\n[They also shared ${embedTypes.join(' and ')}]`;
+  }
+
   const questionOnlyRules = `Rules:
 - Reply in 1-3 sentences max. Be helpful and concise.
 - Never say you're an AI, bot, or assistant. You ARE the brand team.
@@ -842,11 +892,14 @@ CRITICAL STYLE RULES:
 - Ask short natural questions like "what kind of stuff do you post?" or "how long have you been on tiktok?" not formal questions.
 - If someone asks about retainers, just say we're always running them and to check #brand-deals and #announcements.
 - Match the energy. If someone writes one word, don't write four sentences back.
+- If someone shares a video, image, or TikTok link, acknowledge it naturally. You can't see it but react to the fact they shared something.
+- Read the recent conversation in the channel and don't repeat what others have already said. Jump into the flow naturally.
+- If you recognise a returning member, don't treat them like a stranger. A casual "hey again" vibe is fine.
 - Never say you're an AI or bot. You ARE Alice, part of the team.`;
 
   const systemPrompt = `You are ${isConversational ? 'Alice, a friendly team member at' : 'replying as'} ${brandCtx.brandName || 'the brand'} in a Discord community server${isConversational ? '' : ' for creators and affiliates'}.
 
-Brand voice: ${brandCtx.brandVoice || DEFAULT_BRAND.brandVoice}
+Brand voice: ${brandCtx.brandVoice || defaultBotConfig.brandVoice}
 
 Brand context:
 ${contextInfo}
@@ -856,12 +909,15 @@ ${faqEntries}
 
 ${isConversational ? conversationalRules : questionOnlyRules}`;
 
+  // Build enhanced user message with all context
+  const userContent = `Discord message from ${message.author.displayName || message.author.username} in #${message.channel.name}:\n\n${message.content}${mediaInfo}${conversationContext}${memberMemory}`;
+
   try {
     const response = await anthropic.messages.create({
       model: isConversational ? 'claude-sonnet-4-6' : 'claude-haiku-4-5-20251001',
       max_tokens: 200,
       system: systemPrompt,
-      messages: [{ role: 'user', content: `Discord message from ${message.author.displayName || message.author.username} in #${message.channel.name}:\n\n${message.content}` }],
+      messages: [{ role: 'user', content: userContent }],
     });
 
     const reply = response.content[0]?.text?.trim();
@@ -879,11 +935,25 @@ function scheduleAutoReply(message) {
   if (!anthropic) return;
 
   // Don't reply in excluded channels
-  const excludeChannels = brandCtx.excludeChannels || DEFAULT_BRAND.excludeChannels || [];
+  const excludeChannels = brandCtx.excludeChannels || defaultBotConfig.excludeChannels || [];
   const channelName = message.channel.name.replace(/[^\w-]/g, ''); // strip emojis for matching
   if (excludeChannels.some(ex => message.channel.name.includes(ex) || channelName.includes(ex))) return;
 
-  const delayMs = (brandCtx.autoReplyDelayMinutes || DEFAULT_BRAND.autoReplyDelayMinutes || 15) * 60 * 1000;
+  // Busy channel cooldown — if chat is very active, skip some replies
+  if (brandCtx.conversational) {
+    const recentInChannel = message.channel.messages.cache.filter(m =>
+      Date.now() - m.createdTimestamp < 5 * 60 * 1000 && !m.author.bot
+    ).size;
+    if (recentInChannel > 5 && Math.random() < 0.7) {
+      console.log(`Skipping reply in busy #${message.channel.name} (${recentInChannel} msgs in 5min)`);
+      return;
+    }
+  }
+
+  // Variable timing — randomize delay ±30% so replies don't feel robotic
+  const baseDelayMs = (brandCtx.autoReplyDelayMinutes || defaultBotConfig.autoReplyDelayMinutes || 15) * 60 * 1000;
+  const jitter = (Math.random() - 0.5) * baseDelayMs * 0.6;
+  const delayMs = Math.max(60000, Math.round(baseDelayMs + jitter));
 
   const timeoutId = setTimeout(async () => {
     pendingAutoReplies.delete(message.id);
@@ -982,6 +1052,90 @@ function cancelAutoReply(messageId) {
   if (timeoutId) {
     clearTimeout(timeoutId);
     pendingAutoReplies.delete(messageId);
+  }
+}
+
+// ── Spam / Bad Actor Detection ───────────────────────────────────────────────
+const spamTracker = new Map(); // authorId → { count, firstSeen, reasons }
+
+const SPAM_LINK_PATTERNS = [
+  /discord\.gg\/\w+/i,               // Discord invite links
+  /bit\.ly\/\w+/i,                    // Shortened URLs
+  /t\.me\/\w+/i,                      // Telegram links
+  /wa\.me\/\w+/i,                     // WhatsApp links
+  /free\s*(nitro|gift|steam|crypto)/i, // Free nitro/gift scams
+  /claim\s*(your|free|now)/i,         // Claim scams
+  /(earn|make)\s*\$?\d+.*daily/i,     // Money scams
+  /onlyfans\.com/i,                   // NSFW spam
+  /crypto.*airdrop/i,                 // Crypto scams
+  /click\s*(here|this|the\s*link)/i,  // Generic phishing
+  /@everyone.*http/i,                 // @everyone with link
+];
+
+const SPAM_WORD_PATTERNS = [
+  /\b(buy followers|buy likes|get rich quick)\b/i,
+  /\b(dm me for|hmu for|check my bio)\b/i,
+  /\b(nudes|18\+|xxx|porn)\b/i,
+  /\b(wire transfer|western union|cash ?app.*send)\b/i,
+];
+
+function detectSpam(message) {
+  const content = message.content || '';
+  const authorId = message.author.id;
+
+  // Check for spam link patterns
+  for (const pattern of SPAM_LINK_PATTERNS) {
+    if (pattern.test(content)) {
+      trackSpamOffence(authorId, 'suspicious link');
+      const tracker = spamTracker.get(authorId);
+      return { reason: `Suspicious link detected: ${pattern}`, kicked: tracker && tracker.count >= 2 };
+    }
+  }
+
+  // Check for spam word patterns
+  for (const pattern of SPAM_WORD_PATTERNS) {
+    if (pattern.test(content)) {
+      trackSpamOffence(authorId, 'spam content');
+      const tracker = spamTracker.get(authorId);
+      return { reason: `Spam content detected: ${pattern}`, kicked: tracker && tracker.count >= 2 };
+    }
+  }
+
+  // Mass mentions (3+ user mentions in one message)
+  const mentionCount = (content.match(/<@!?\d+>/g) || []).length;
+  if (mentionCount >= 3) {
+    trackSpamOffence(authorId, 'mass mentions');
+    const tracker = spamTracker.get(authorId);
+    return { reason: `Mass mentions (${mentionCount} users)`, kicked: tracker && tracker.count >= 2 };
+  }
+
+  // Rapid-fire messages (5+ messages in 10 seconds)
+  const cached = message.channel.messages.cache.filter(m =>
+    m.author.id === authorId && Date.now() - m.createdTimestamp < 10000
+  );
+  if (cached.size >= 5) {
+    trackSpamOffence(authorId, 'message flooding');
+    const tracker = spamTracker.get(authorId);
+    return { reason: `Message flooding (${cached.size} messages in 10s)`, kicked: tracker && tracker.count >= 3 };
+  }
+
+  return null; // not spam
+}
+
+function trackSpamOffence(authorId, reason) {
+  const existing = spamTracker.get(authorId);
+  if (existing) {
+    existing.count++;
+    existing.reasons.push(reason);
+  } else {
+    spamTracker.set(authorId, { count: 1, firstSeen: Date.now(), reasons: [reason] });
+  }
+  // Clean up old entries every hour
+  if (spamTracker.size > 100) {
+    const hourAgo = Date.now() - 3600000;
+    for (const [id, data] of spamTracker) {
+      if (data.firstSeen < hourAgo) spamTracker.delete(id);
+    }
   }
 }
 
@@ -1307,6 +1461,36 @@ client.on('messageCreate', async (message) => {
 
   const isTeam = isTeamMember(message.member);
 
+  // ── Spam / bad actor detection ──
+  if (!isTeam) {
+    const flagged = detectSpam(message);
+    if (flagged) {
+      try {
+        await message.delete();
+        console.log(`[Spam] Deleted message from ${message.author.username} in #${message.channel.name}: ${flagged.reason}`);
+        // Alert team via Slack
+        await slackAlert(`:rotating_light: Spam detected in ${message.guild.name}`, [
+          { type: 'section', text: { type: 'mrkdwn',
+            text: `*#${message.channel.name}* — ${message.author.username}\n*Reason:* ${flagged.reason}\n*Content:* ${message.content?.substring(0, 300) || '(no text)'}` } },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: flagged.kicked ? ':boot: User was kicked' : ':wastebasket: Message deleted — user not kicked (single offence)' }] },
+        ]);
+        // Alert in Discord team channel
+        const alertChannel = await getOrCreateAlertChannel(message.guild);
+        if (alertChannel) {
+          await alertChannel.send(`**Spam detected** — deleted message from ${message.author.username} in #${message.channel.name}\nReason: ${flagged.reason}\nContent: \`${message.content?.substring(0, 200) || '(no text)'}\``);
+        }
+        // If severe (multiple offences), kick the user
+        if (flagged.kicked && message.member?.kickable) {
+          await message.member.kick('Automated spam detection');
+          console.log(`[Spam] Kicked ${message.author.username} from ${message.guild.name}`);
+        }
+      } catch (err) {
+        console.error(`[Spam] Error handling spam from ${message.author.username}: ${err.message}`);
+      }
+      return; // don't process further
+    }
+  }
+
   if (await handleProxyCommand(message)) return;
   if (await handleStatusCommand(message)) return;
   if (await handleInspireCommand(message)) return;
@@ -1339,6 +1523,30 @@ client.on('guildMemberAdd', async (member) => {
       event_type: 'join',
     });
   } catch (err) { console.error('Member join track error:', err.message); }
+
+  // Welcome DM for conversational servers
+  const brandCtx = getBrandContext(member.guild.id);
+  if (brandCtx.conversational) {
+    const displayName = member.displayName || member.user.displayName || member.user.username;
+    const templates = [
+      `Hey ${displayName}! Welcome to ${member.guild.name} :) Head over to #intro-yourself to say hi, and check out #brand-deals for any current opportunities. Let me know if you have any questions!`,
+      `Welcome to ${member.guild.name}! I'm Alice from the team. Drop an intro in #intro-yourself when you get a chance, and keep an eye on #announcements for updates. Glad to have you here!`,
+      `Hey! Welcome to ${member.guild.name} :) If you want to get started, check out #intro-yourself and #brand-deals. Let me know if you need anything!`,
+    ];
+    const dmText = templates[Math.floor(Math.random() * templates.length)];
+    try {
+      await member.send(dmText);
+      console.log(`[Welcome DM] Sent to ${member.user.username} in ${member.guild.name}`);
+      // Log to Slack so team can see every DM
+      await slackAlert(`Alice DM'd new member in ${member.guild.name}`, [
+        { type: 'section', text: { type: 'mrkdwn',
+          text: `*New member:* ${member.user.username}\n*DM sent:*\n>${dmText}` } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: ':wave: Welcome DM — team can see but member cannot tell' }] },
+      ]);
+    } catch (err) {
+      console.log(`[Welcome DM] Could not DM ${member.user.username} (DMs may be disabled): ${err.message}`);
+    }
+  }
 });
 
 client.on('guildMemberRemove', async (member) => {
