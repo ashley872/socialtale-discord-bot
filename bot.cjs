@@ -420,9 +420,12 @@ async function handleStatusCommand(message) {
   return true;
 }
 
-// ── Content Inspiration (!inspire command + weekly scheduled) ────────────────
+// ── Content Inspiration (/inspo + !inspire + Tue/Thu scheduled) ──────────────
+// Top performing creator videos with a full AI breakdown of each: hook, format,
+// emotional driver, pain point, difficulty to replicate, and a specific
+// adaptation suggestion. Ranked by GMV (views as tiebreak) over the last 7 days.
 async function getTopVideosForServer(serverId, limit = 5) {
-  if (!hubSupabase) return [];
+  if (!hubSupabase) return { videos: [], windowDays: 7 };
 
   // Look up brand_id from discord_server_id
   const { data: brand } = await hubSupabase
@@ -431,22 +434,31 @@ async function getTopVideosForServer(serverId, limit = 5) {
     .eq('discord_server_id', serverId)
     .single();
 
-  if (!brand) return [];
+  if (!brand) return { videos: [], windowDays: 7 };
 
-  // Get top videos from last 30 days
-  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
-  const today = new Date().toISOString().split('T')[0];
+  const fetchWindow = async (days) => {
+    const since = new Date(Date.now() - days * 86400000).toISOString().split('T')[0];
+    const { data } = await hubSupabase
+      .from('creator_videos')
+      .select('*')
+      .eq('brand_id', brand.id)
+      .gte('post_date', since)
+      .order('views', { ascending: false })
+      .limit(25);
+    return (data || []).filter(v => v.video_url && v.views > 0);
+  };
 
-  const { data: videos } = await hubSupabase
-    .from('creator_videos')
-    .select('video_url, tiktok_account, views, gmv, orders, likes, comments, shares, post_date')
-    .eq('brand_id', brand.id)
-    .gte('post_date', thirtyDaysAgo)
-    .lte('post_date', today)
-    .order('views', { ascending: false })
-    .limit(limit);
+  // Last 7 days by default; widen to 30 when the week is thin
+  let windowDays = 7;
+  let videos = await fetchWindow(7);
+  if (videos.length < limit) {
+    windowDays = 30;
+    videos = await fetchWindow(30);
+  }
 
-  return (videos || []).filter(v => v.video_url && v.views > 0);
+  // Rank by GMV first (what actually converts), views as tiebreak
+  videos.sort((a, b) => (Number(b.gmv) || 0) - (Number(a.gmv) || 0) || (b.views || 0) - (a.views || 0));
+  return { videos: videos.slice(0, limit), windowDays };
 }
 
 function formatViews(n) {
@@ -455,48 +467,141 @@ function formatViews(n) {
   return String(n);
 }
 
-async function postContentInspiration(guild, targetChannel) {
-  const videos = await getTopVideosForServer(guild.id);
-  if (!videos.length) return false;
+function formatMoney(n) {
+  const num = Number(n) || 0;
+  return '$' + num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function engagementRate(v) {
+  if (!v.views) return null;
+  const interactions = (v.likes || 0) + (v.comments || 0) + (v.shares || 0);
+  return Math.round((interactions / v.views) * 10000) / 100;
+}
+
+// One Claude call analyzes the whole batch — returns array of breakdowns (or null)
+async function analyzeTopVideos(videos, brandName) {
+  if (!anthropic) return null;
+
+  const summaries = videos.map((v, i) => {
+    const lines = [`Video ${i + 1} — @${v.tiktok_account || 'unknown creator'}`];
+    // Include whatever descriptive metadata the Euka sync provides
+    for (const key of ['video_title', 'title', 'caption', 'description', 'product_name', 'hashtags']) {
+      if (v[key]) lines.push(`${key}: ${String(v[key]).substring(0, 300)}`);
+    }
+    const er = engagementRate(v);
+    lines.push(`stats: ${formatViews(v.views)} views, ${formatMoney(v.gmv)} GMV, ${v.orders || 0} orders, ${formatViews(v.likes || 0)} likes, ${v.comments || 0} comments, ${v.shares || 0} shares${er !== null ? `, ${er}% engagement` : ''}`);
+    return lines.join('\n');
+  }).join('\n\n');
+
+  const prompt = `You are analyzing the top-performing TikTok Shop creator videos for the brand "${brandName}" so other creators in the community can study and adapt what works.
+
+${summaries}
+
+For EACH video, return a JSON object with these keys (each value max 25 words, punchy and specific):
+- "whyItWorked": why this video performed, grounded in the stats and metadata given
+- "format": the likely video format (prefix with "Likely" if inferring from limited data)
+- "hook": the likely opening hook approach
+- "emotion": the emotional driver
+- "painPoint": the pain point or desire it targets
+- "difficulty": exactly one of "easy", "medium", "hard" — how hard to replicate
+- "score": integer 1-10, overall replicability-adjusted quality
+- "howToAdapt": one specific, actionable suggestion for how a creator should adapt this
+
+Only use the data provided — do not invent details. When inferring, say so ("Likely...").
+Respond with ONLY a JSON array of ${videos.length} objects, in the same order as the videos. No other text.`;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 2000,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const text = response.content[0]?.text || '';
+    const start = text.indexOf('[');
+    const end = text.lastIndexOf(']');
+    if (start === -1 || end === -1) return null;
+    const parsed = JSON.parse(text.substring(start, end + 1));
+    return Array.isArray(parsed) ? parsed : null;
+  } catch (err) {
+    console.error('Video analysis error:', err.message);
+    return null;
+  }
+}
+
+function buildVideoEmbed(v, analysis, rank) {
+  const creator = v.tiktok_account ? `@${v.tiktok_account}` : 'Creator';
+  const er = engagementRate(v);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`#${rank} — ${creator}`)
+    .setURL(v.video_url)
+    .setColor(0x10B981)
+    .addFields(
+      { name: '💰 Revenue', value: formatMoney(v.gmv), inline: true },
+      { name: '👀 Views', value: formatViews(v.views), inline: true },
+      { name: '❤️ Engagement', value: er !== null ? `${er}%` : '—', inline: true },
+    );
+
+  if (analysis) {
+    if (analysis.whyItWorked) embed.addFields({ name: '✨ Why It Worked', value: String(analysis.whyItWorked).substring(0, 1024) });
+    if (analysis.format) embed.addFields({ name: '🎬 Format', value: String(analysis.format).substring(0, 1024) });
+    if (analysis.hook) embed.addFields({ name: '🪝 Hook', value: String(analysis.hook).substring(0, 1024) });
+    if (analysis.emotion) embed.addFields({ name: '🫀 Emotion', value: String(analysis.emotion).substring(0, 1024) });
+    if (analysis.painPoint) embed.addFields({ name: '🎯 Pain Point', value: String(analysis.painPoint).substring(0, 1024) });
+    if (analysis.difficulty) embed.addFields({ name: '⚡ Difficulty', value: String(analysis.difficulty), inline: true });
+    if (analysis.score) embed.addFields({ name: '📊 Score', value: `${analysis.score}/10`, inline: true });
+    if (analysis.howToAdapt) embed.addFields({ name: '🚀 How To Adapt This', value: String(analysis.howToAdapt).substring(0, 1024) });
+  }
+
+  embed.setFooter({ text: 'Study it, adapt it, ship it.' });
+  return embed;
+}
+
+// Cache built content per guild so /inspo can't rack up API cost
+const inspoCache = new Map(); // guildId → { at, intro, embeds }
+const INSPO_CACHE_MS = 6 * 3600000;
+
+async function buildInspoContent(guild, { force = false } = {}) {
+  const cached = inspoCache.get(guild.id);
+  if (!force && cached && Date.now() - cached.at < INSPO_CACHE_MS) return cached;
+
+  const { videos, windowDays } = await getTopVideosForServer(guild.id);
+  if (!videos.length) return null;
 
   const brandCtx = getBrandContext(guild.id);
   const brandName = brandCtx.brandName || guild.name;
 
-  const embed = new EmbedBuilder()
-    .setTitle(`Top Performing Content This Month`)
-    .setDescription(`Here's what's been working — use these as inspiration for your next video!`)
-    .setColor(0x10B981)
-    .setTimestamp();
+  const analyses = (await analyzeTopVideos(videos, brandName)) || [];
+  const embeds = videos.map((v, i) => buildVideoEmbed(v, analyses[i], i + 1));
+  const intro = `**Top ${videos.length} performing creator videos from the last ${windowDays} days** 📈\nReal videos. Real GMV. Real analysis. Study the breakdowns below, adapt what works, ship your version. Type \`/inspo\` any time for the latest.`;
 
-  for (const [i, v] of videos.entries()) {
-    const creator = v.tiktok_account ? `@${v.tiktok_account}` : 'Creator';
-    const stats = [
-      `${formatViews(v.views)} views`,
-      v.orders > 0 ? `${v.orders} orders` : null,
-      v.likes > 0 ? `${formatViews(v.likes)} likes` : null,
-    ].filter(Boolean).join(' · ');
+  const content = { at: Date.now(), intro, embeds };
+  inspoCache.set(guild.id, content);
+  return content;
+}
 
-    embed.addFields({
-      name: `${i + 1}. ${creator}`,
-      value: `${stats}\n[Watch video](${v.video_url})`,
-    });
-  }
+async function postContentInspiration(guild, targetChannel, { force = false } = {}) {
+  const content = await buildInspoContent(guild, { force });
+  if (!content) return false;
 
-  embed.setFooter({ text: 'Keep creating authentic content — these prove it works!' });
+  const brandCtx = getBrandContext(guild.id);
+  const brandName = brandCtx.brandName || guild.name;
 
-  // Post via webhook as brand
-  const webhook = await getOrCreateWebhook(targetChannel, brandName);
-  if (webhook) {
-    await webhook.send({
-      embeds: [embed],
-      username: brandName,
-      avatarURL: guild.iconURL({ size: 128 }),
-    });
+  if (brandCtx.conversational) {
+    // Conversational servers — post directly as the bot
+    await targetChannel.send(content.intro);
+    for (const embed of content.embeds) await targetChannel.send({ embeds: [embed] });
   } else {
-    await targetChannel.send({ embeds: [embed] });
+    // Brand servers — post via webhook as the brand
+    const webhook = await getOrCreateWebhook(targetChannel, brandName);
+    const send = webhook
+      ? (payload) => webhook.send({ ...payload, username: brandName, avatarURL: guild.iconURL({ size: 128 }) })
+      : (payload) => targetChannel.send(payload);
+    await send({ content: content.intro });
+    for (const embed of content.embeds) await send({ embeds: [embed] });
   }
 
-  console.log(`Content inspiration posted in #${targetChannel.name} (${guild.name}) — ${videos.length} videos`);
+  console.log(`Content inspiration posted in #${targetChannel.name} (${guild.name}) — ${content.embeds.length} videos`);
   return true;
 }
 
@@ -509,7 +614,7 @@ async function handleInspireCommand(message) {
     return true;
   }
 
-  const posted = await postContentInspiration(message.guild, message.channel);
+  const posted = await postContentInspiration(message.guild, message.channel, { force: true });
   if (!posted) {
     await message.reply('No video performance data available for this brand yet. Make sure Euka sync is running in the Hub.');
   }
@@ -518,7 +623,7 @@ async function handleInspireCommand(message) {
   return true;
 }
 
-// Weekly content inspiration (every Monday at 10:00)
+// Scheduled content inspiration (Tuesday & Thursday at 10:00)
 async function postWeeklyInspiration() {
   if (!hubSupabase) return;
 
@@ -532,9 +637,9 @@ async function postWeeklyInspiration() {
 
       if (!target) continue;
 
-      await postContentInspiration(guild, target);
+      await postContentInspiration(guild, target, { force: true });
     } catch (err) {
-      console.error(`Weekly inspiration error for ${guild.name}:`, err.message);
+      console.error(`Scheduled inspiration error for ${guild.name}:`, err.message);
     }
   }
 }
@@ -1879,6 +1984,16 @@ client.on('ready', async () => {
   console.log(`Bot logged in as ${client.user.tag}`);
   console.log(`Auto-monitoring ${serverNames.length} server(s): ${serverNames.join(', ')}`);
 
+  // Register /inspo slash command (global — available in every server)
+  try {
+    await client.application.commands.set([
+      { name: 'inspo', description: 'Get top-performing creator content in your brand community' },
+    ]);
+    console.log('Registered /inspo slash command');
+  } catch (err) {
+    console.error('Slash command registration error:', err.message);
+  }
+
   // Load bot config from Hub Supabase (non-blocking on failure — falls back to static JSON)
   await loadBotConfigFromDB().catch(err => console.error('Initial config load failed:', err.message));
   setInterval(loadBotConfigFromDB, CONFIG_POLL_MS);
@@ -1893,8 +2008,9 @@ client.on('ready', async () => {
   scheduleDaily(23, 55, takeMetricsSnapshot);
   scheduleDaily(9, 0, postDailyDigest);
 
-  // Weekly content inspiration — Monday at 10:00
-  scheduleWeekly(1, 10, 0, postWeeklyInspiration);
+  // Content inspiration — Tuesday & Thursday at 10:00
+  scheduleWeekly(2, 10, 0, postWeeklyInspiration);
+  scheduleWeekly(4, 10, 0, postWeeklyInspiration);
 
   // Engagement posts — Mon/Tue/Wed/Thu/Fri conversation starters
   scheduleEngagement();
@@ -1997,6 +2113,42 @@ client.on('messageCreate', async (message) => {
     if (sentiment) {
       await handleNegativeSentiment(message, sentiment);
     }
+  }
+});
+
+// ── /inspo — on-demand top performers, available to any community member ─────
+const inspoCooldowns = new Map(); // userId → last-use timestamp
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'inspo') return;
+
+  if (!interaction.guild) {
+    await interaction.reply({ content: 'Run this inside a brand community server.', ephemeral: true });
+    return;
+  }
+
+  // Per-user cooldown (team members exempt) — content is cached anyway, this just stops spam
+  const last = inspoCooldowns.get(interaction.user.id) || 0;
+  if (Date.now() - last < 2 * 60 * 1000 && !isTeamMember(interaction.member)) {
+    await interaction.reply({ content: 'Give it a couple of minutes before pulling `/inspo` again.', ephemeral: true });
+    return;
+  }
+  inspoCooldowns.set(interaction.user.id, Date.now());
+
+  await interaction.deferReply();
+  try {
+    const content = await buildInspoContent(interaction.guild);
+    if (!content) {
+      await interaction.editReply('No video performance data for this community yet — check back soon!');
+      return;
+    }
+    await interaction.editReply(content.intro);
+    for (const embed of content.embeds) {
+      await interaction.followUp({ embeds: [embed] });
+    }
+  } catch (err) {
+    console.error('/inspo error:', err.message);
+    try { await interaction.editReply('Something went wrong pulling top performers — try again shortly.'); } catch (_) {}
   }
 });
 
