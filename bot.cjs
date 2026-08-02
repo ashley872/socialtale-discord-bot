@@ -89,6 +89,10 @@ async function loadBotConfigFromDB() {
       if (row.conversational !== undefined && row.conversational !== null) {
         dbConfig.conversational = row.conversational;
       }
+      // Only set cruvaShopId if DB explicitly has it; otherwise preserve static JSON value
+      if (row.cruva_shop_id) {
+        dbConfig.cruvaShopId = row.cruva_shop_id;
+      }
 
       if (row.discord_server_id === '_default') {
         defaultBotConfig = { ...defaultBotConfig, ...dbConfig };
@@ -424,8 +428,68 @@ async function handleStatusCommand(message) {
 // Top performing creator videos with a full AI breakdown of each: hook, format,
 // emotional driver, pain point, difficulty to replicate, and a specific
 // adaptation suggestion. Ranked by GMV (views as tiebreak) over the last 7 days.
-async function getTopVideosForServer(serverId, limit = 5) {
-  if (!hubSupabase) return { videos: [], windowDays: 7 };
+//
+// Video source: Cruva (per-server cruvaShopId + CRUVA_API_URL/CRUVA_API_KEY
+// env vars), falling back to the legacy Hub Supabase creator_videos table.
+const CRUVA_API_URL = process.env.CRUVA_API_URL || null;
+const CRUVA_API_KEY = process.env.CRUVA_API_KEY || null;
+
+// Normalize a Cruva video record to the bot's internal shape
+function normalizeCruvaVideo(v) {
+  return {
+    video_url: v.video_link || v.video_url || v.url || null,
+    tiktok_account: v.handle || v.tiktok_account || null,
+    views: v.views ?? v.view_count ?? 0,
+    gmv: Number(v.gmv) || 0,
+    orders: v.units_sold ?? v.orders ?? 0,
+    likes: v.likes ?? v.like_count ?? 0,
+    comments: v.comments ?? v.comment_count ?? 0,
+    shares: v.shares ?? v.share_count ?? 0,
+    title: v.title || null,
+    transcript: v.transcript || null,
+    content_overview: v.content_overview || null,
+    cruva_engagement_rate: v.engagement_rate ?? null,
+    cruva_hooks: Array.isArray(v.hooks) ? v.hooks : null,
+  };
+}
+
+async function fetchCruvaTopVideos(shopId, days) {
+  const dateTo = new Date().toISOString().split('T')[0];
+  const dateFrom = new Date(Date.now() - days * 86400000).toISOString().split('T')[0];
+
+  const res = await fetch(CRUVA_API_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${CRUVA_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      shop_id: shopId,
+      timeseries: true,
+      date_from: dateFrom,
+      date_to: dateTo,
+      sort_by: 'gmv',
+      sort_direction: 'desc',
+      page_size: 25,
+      min_view_count: 1,
+    }),
+  });
+  if (!res.ok) throw new Error(`Cruva API ${res.status}`);
+
+  let payload = await res.json();
+  // Tolerate common response envelopes: bare array, {videos}, {data}, {result},
+  // or an MCP-style {result: "...json..."} string
+  if (typeof payload.result === 'string') {
+    const s = payload.result.indexOf('[');
+    const e = payload.result.lastIndexOf(']');
+    payload = s !== -1 && e !== -1 ? JSON.parse(payload.result.substring(s, e + 1)) : [];
+  }
+  const list = Array.isArray(payload) ? payload : (payload.videos || payload.data || payload.result || []);
+  return list.map(normalizeCruvaVideo).filter(v => v.video_url && v.views > 0);
+}
+
+async function getTopVideosFromHub(serverId) {
+  if (!hubSupabase) return null;
 
   // Look up brand_id from discord_server_id
   const { data: brand } = await hubSupabase
@@ -434,9 +498,9 @@ async function getTopVideosForServer(serverId, limit = 5) {
     .eq('discord_server_id', serverId)
     .single();
 
-  if (!brand) return { videos: [], windowDays: 7 };
+  if (!brand) return null;
 
-  const fetchWindow = async (days) => {
+  return async (days) => {
     const since = new Date(Date.now() - days * 86400000).toISOString().split('T')[0];
     const { data } = await hubSupabase
       .from('creator_videos')
@@ -447,13 +511,32 @@ async function getTopVideosForServer(serverId, limit = 5) {
       .limit(25);
     return (data || []).filter(v => v.video_url && v.views > 0);
   };
+}
+
+async function getTopVideosForServer(serverId, limit = 5) {
+  const brandCtx = getBrandContext(serverId);
+
+  // Pick data source: Cruva when configured for this server, else legacy Hub
+  let fetchWindow = null;
+  if (CRUVA_API_URL && CRUVA_API_KEY && brandCtx.cruvaShopId) {
+    fetchWindow = (days) => fetchCruvaTopVideos(brandCtx.cruvaShopId, days);
+  } else {
+    fetchWindow = await getTopVideosFromHub(serverId).catch(() => null);
+  }
+  if (!fetchWindow) return { videos: [], windowDays: 7 };
 
   // Last 7 days by default; widen to 30 when the week is thin
   let windowDays = 7;
-  let videos = await fetchWindow(7);
-  if (videos.length < limit) {
-    windowDays = 30;
-    videos = await fetchWindow(30);
+  let videos = [];
+  try {
+    videos = await fetchWindow(7);
+    if (videos.length < limit) {
+      windowDays = 30;
+      videos = await fetchWindow(30);
+    }
+  } catch (err) {
+    console.error(`Top videos fetch error for ${serverId}:`, err.message);
+    return { videos: [], windowDays };
   }
 
   // Rank by GMV first (what actually converts), views as tiebreak
@@ -473,6 +556,9 @@ function formatMoney(n) {
 }
 
 function engagementRate(v) {
+  if (v.cruva_engagement_rate !== null && v.cruva_engagement_rate !== undefined) {
+    return Math.round(v.cruva_engagement_rate * 100) / 100;
+  }
   if (!v.views) return null;
   const interactions = (v.likes || 0) + (v.comments || 0) + (v.shares || 0);
   return Math.round((interactions / v.views) * 10000) / 100;
@@ -484,9 +570,15 @@ async function analyzeTopVideos(videos, brandName) {
 
   const summaries = videos.map((v, i) => {
     const lines = [`Video ${i + 1} — @${v.tiktok_account || 'unknown creator'}`];
-    // Include whatever descriptive metadata the Euka sync provides
-    for (const key of ['video_title', 'title', 'caption', 'description', 'product_name', 'hashtags']) {
+    // Descriptive metadata — Cruva provides title, content overview, transcript,
+    // and its own scored hook analysis, which grounds the breakdown in the
+    // actual video content rather than inference
+    for (const key of ['video_title', 'title', 'caption', 'description', 'product_name', 'hashtags', 'content_overview']) {
       if (v[key]) lines.push(`${key}: ${String(v[key]).substring(0, 300)}`);
+    }
+    if (v.transcript) lines.push(`transcript: ${String(v.transcript).substring(0, 600)}`);
+    if (v.cruva_hooks?.length) {
+      lines.push(`hook_analysis: ${v.cruva_hooks.map(h => `"${h.hook}" (score ${h.score}: ${h.explanation})`).join(' | ').substring(0, 500)}`);
     }
     const er = engagementRate(v);
     lines.push(`stats: ${formatViews(v.views)} views, ${formatMoney(v.gmv)} GMV, ${v.orders || 0} orders, ${formatViews(v.likes || 0)} likes, ${v.comments || 0} comments, ${v.shares || 0} shares${er !== null ? `, ${er}% engagement` : ''}`);
@@ -1308,6 +1400,18 @@ const ENGAGEMENT_PROMPTS = {
   ],
 };
 
+// Find the main community-chat or general channel the bot can post in
+function findCommunityChannel(guild) {
+  const textChannels = guild.channels.cache.filter(c => c.type === 0);
+  const target = textChannels.find(c => c.name.includes('community') && c.name.includes('chat'))
+    || textChannels.find(c => c.name.includes('general') && !c.name.includes('alert'))
+    || textChannels.find(c => c.name.includes('chat') && !c.name.includes('alert') && !c.name.includes('team'));
+
+  if (!target) return null;
+  if (!target.permissionsFor(client.user)?.has(['ViewChannel', 'SendMessages'])) return null;
+  return target;
+}
+
 async function postEngagementMessage(type) {
   const prompts = ENGAGEMENT_PROMPTS[type];
   if (!prompts?.length) return;
@@ -1319,14 +1423,8 @@ async function postEngagementMessage(type) {
     const brandCtx = getBrandContext(guild.id);
     if (!brandCtx.conversational) continue; // only post in conversational servers
 
-    // Find community-chat or general channel
-    const textChannels = guild.channels.cache.filter(c => c.type === 0);
-    const target = textChannels.find(c => c.name.includes('community') && c.name.includes('chat'))
-      || textChannels.find(c => c.name.includes('general') && !c.name.includes('alert'))
-      || textChannels.find(c => c.name.includes('chat') && !c.name.includes('alert') && !c.name.includes('team'));
-
+    const target = findCommunityChannel(guild);
     if (!target) continue;
-    if (!target.permissionsFor(client.user)?.has(['ViewChannel', 'SendMessages'])) continue;
 
     try {
       // Post as Alice (directly, not via webhook — she's a community member)
@@ -1343,6 +1441,103 @@ function scheduleEngagement() {
     scheduleWeekly(slot.day, slot.hour, 0, () => postEngagementMessage(slot.type));
   }
   console.log(`Scheduled ${ENGAGEMENT_SCHEDULE.length} weekly engagement posts`);
+}
+
+// ── Member Milestone Shoutouts ────────────────────────────────────────────────
+// Celebrates when a server crosses a member milestone, and hypes the community
+// when it's within 10 members of the next one ("we're almost at 400!").
+function isMemberMilestone(n) {
+  if (n >= 50 && n <= 500) return n % 50 === 0;
+  if (n > 500 && n <= 1000) return n % 100 === 0;
+  if (n > 1000) return n % 500 === 0;
+  return false;
+}
+
+function nextMilestoneAfter(n) {
+  for (let m = n + 1; m <= n + 500; m++) {
+    if (isMemberMilestone(m)) return m;
+  }
+  return null;
+}
+
+const MILESTONE_MESSAGES = [
+  '🎉 WE JUST HIT {count} MEMBERS! Huge welcome to everyone who joined recently — this community is growing so fast. Here\'s to the next milestone 🚀',
+  '{count} MEMBERS!! 🎉 So proud of what this community is becoming. Every single one of you makes this place what it is 💚',
+  'Big moment — we just passed {count} members! 🥳 Thanks for being here, sharing your wins, and making this the best creator community around',
+];
+
+const APPROACHING_MESSAGES = [
+  '👀 We\'re only {remaining} away from {milestone} members... who\'s bringing friends to push us over the line? 🚀',
+  'So close to {milestone} members — just {remaining} to go! Know a creator who\'d love it here? Send them an invite 👇',
+  'Almost at {milestone} members!! {remaining} to go — let\'s make it happen this week 💪',
+];
+
+const milestoneState = new Map(); // guildId → { lastCount, announced: Set }
+
+async function postMilestoneMessage(guild, text) {
+  const target = findCommunityChannel(guild);
+  if (!target) return false;
+
+  const brandCtx = getBrandContext(guild.id);
+  if (brandCtx.conversational) {
+    // Conversational servers — post directly as the bot
+    await target.send(text);
+  } else {
+    // Brand servers — post via webhook as the brand
+    const brandName = brandCtx.brandName || guild.name;
+    const webhook = await getOrCreateWebhook(target, brandName);
+    if (webhook) {
+      await webhook.send({ content: text, username: brandName, avatarURL: guild.iconURL({ size: 128 }) });
+    } else {
+      await target.send(text);
+    }
+  }
+  return true;
+}
+
+async function checkMemberMilestones(guild) {
+  const count = guild.memberCount;
+  let state = milestoneState.get(guild.id);
+  if (!state) {
+    state = { lastCount: count - 1, announced: new Set() };
+    milestoneState.set(guild.id, state);
+  }
+  const prev = state.lastCount;
+  state.lastCount = count;
+  if (count <= prev) return; // only act on growth
+
+  try {
+    // Milestone hit — celebrate every milestone crossed since the last count
+    for (let m = prev + 1; m <= count; m++) {
+      if (!isMemberMilestone(m) || state.announced.has(m)) continue;
+      state.announced.add(m);
+      const text = MILESTONE_MESSAGES[Math.floor(Math.random() * MILESTONE_MESSAGES.length)]
+        .replace(/\{count\}/g, String(m));
+      const posted = await postMilestoneMessage(guild, text);
+      if (posted) console.log(`[Milestone] ${guild.name} hit ${m} members — celebrated`);
+      await slackAlert(`🎉 ${guild.name} just hit ${m} Discord members`, [
+        { type: 'section', text: { type: 'mrkdwn',
+          text: `*${guild.name}* crossed *${m} members* (now at ${count})${posted ? ' — celebration posted in the community' : ''}` } },
+      ]);
+    }
+
+    // Approaching a milestone — hype once when crossing into the last 10
+    const next = nextMilestoneAfter(count);
+    if (next && next >= 100) {
+      const hypeAt = next - 10;
+      const hypeKey = `pre-${next}`;
+      if (prev < hypeAt && count >= hypeAt && !state.announced.has(hypeKey)) {
+        state.announced.add(hypeKey);
+        const text = APPROACHING_MESSAGES[Math.floor(Math.random() * APPROACHING_MESSAGES.length)]
+          .replace(/\{milestone\}/g, String(next))
+          .replace(/\{remaining\}/g, String(next - count));
+        const posted = await postMilestoneMessage(guild, text);
+        if (posted) console.log(`[Milestone] ${guild.name} approaching ${next} members (${count}) — hyped`);
+      }
+    }
+  } catch (err) {
+    console.error(`[Milestone] Error in ${guild.name}:`, err.message);
+  }
 }
 
 // ── Sentiment Detection — fast-track alert for frustrated members ─────────────
@@ -2163,6 +2358,9 @@ client.on('guildMemberAdd', async (member) => {
     });
   } catch (err) { console.error('Member join track error:', err.message); }
 
+  // Milestone shoutouts — celebrate growth as the community crosses thresholds
+  await checkMemberMilestones(member.guild);
+
   // Welcome DM for conversational servers
   const brandCtx = getBrandContext(member.guild.id);
   if (brandCtx.conversational) {
@@ -2190,6 +2388,9 @@ client.on('guildMemberAdd', async (member) => {
 
 client.on('guildMemberRemove', async (member) => {
   console.log(`[${member.guild.name}] Left: ${member.user.username}`);
+  // Keep milestone tracking in sync so a later re-crossing isn't miscounted
+  const mState = milestoneState.get(member.guild.id);
+  if (mState) mState.lastCount = member.guild.memberCount;
   try {
     await supabase.from('discord_member_events').insert({
       discord_server_id: member.guild.id,
