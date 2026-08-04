@@ -93,6 +93,10 @@ async function loadBotConfigFromDB() {
       if (row.cruva_shop_id) {
         dbConfig.cruvaShopId = row.cruva_shop_id;
       }
+      // Office hours (jsonb: { days, start, end, timezone }) — dashboard-managed
+      if (row.office_hours) {
+        dbConfig.officeHours = row.office_hours;
+      }
 
       if (row.discord_server_id === '_default') {
         defaultBotConfig = { ...defaultBotConfig, ...dbConfig };
@@ -384,6 +388,87 @@ async function handleProxyCommand(message) {
 
   try { await message.delete(); } catch (_) {}
   console.log(`Proxy posted in #${targetChannel.name} (${message.guild.name})`);
+  return true;
+}
+
+// ── Bot Activity Control — office hours + manual override + dashboard flag ───
+// The bot's auto-replies can be controlled three ways (strongest first):
+// 1. Manual override — team runs !alice on / !alice off / !alice auto in Discord (instant)
+// 2. Office hours — when configured, the bot stays quiet while the team is
+//    online and takes over outside those hours ({ days, start, end, timezone })
+// 3. Dashboard — auto_reply_enabled in discord_bot_config (picked up within 5 min)
+// Unanswered tracking, alerts, metrics, and scheduled posts always keep running.
+const botOverride = new Map(); // serverId → 'on' | 'off' (absent = follow schedule/dashboard)
+
+function isWithinOfficeHours(oh) {
+  if (!oh || !oh.start || !oh.end) return false;
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: oh.timezone || 'Europe/London',
+      hourCycle: 'h23', weekday: 'short', hour: '2-digit', minute: '2-digit',
+    }).formatToParts(new Date());
+    const get = (t) => parts.find(p => p.type === t)?.value;
+    const dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    const day = dayMap[get('weekday')];
+    if (!(oh.days || [1, 2, 3, 4, 5]).includes(day)) return false;
+
+    const mins = (parseInt(get('hour'), 10) % 24) * 60 + parseInt(get('minute'), 10);
+    const [sh, sm] = String(oh.start).split(':').map(Number);
+    const [eh, em] = String(oh.end).split(':').map(Number);
+    const startM = sh * 60 + (sm || 0);
+    const endM = eh * 60 + (em || 0);
+    // Overnight ranges (e.g. 22:00–06:00) wrap past midnight
+    return startM <= endM ? (mins >= startM && mins < endM) : (mins >= startM || mins < endM);
+  } catch (err) {
+    console.error('Office hours parse error:', err.message);
+    return false;
+  }
+}
+
+function isBotActive(serverId) {
+  const override = botOverride.get(serverId);
+  if (override === 'on') return { active: true, reason: 'manual override (on)' };
+  if (override === 'off') return { active: false, reason: 'manual override (off)' };
+
+  const brandCtx = getBrandContext(serverId);
+  if (!brandCtx.autoReplyEnabled) return { active: false, reason: 'disabled from dashboard' };
+  if (isWithinOfficeHours(brandCtx.officeHours)) {
+    return { active: false, reason: 'office hours — team is online' };
+  }
+  return { active: true, reason: brandCtx.officeHours ? 'outside office hours — bot covering' : 'auto-reply enabled' };
+}
+
+async function handleAliceCommand(message) {
+  const match = message.content.match(/^!alice\s+(on|off|auto|status)$/i);
+  if (!match) return false;
+  if (!isTeamMember(message.member)) return false;
+
+  const serverId = message.guild.id;
+  const sub = match[1].toLowerCase();
+
+  if (sub === 'on' || sub === 'off') {
+    botOverride.set(serverId, sub);
+    await message.reply(sub === 'on'
+      ? 'Auto-replies are **ON** (manual override). Run `!alice auto` to go back to the schedule.'
+      : 'Auto-replies are **OFF** (manual override) — all yours! Run `!alice auto` to go back to the schedule.');
+    console.log(`[Control] ${message.author.username} set override ${sub} in ${message.guild.name}`);
+  } else if (sub === 'auto') {
+    botOverride.delete(serverId);
+    const state = isBotActive(serverId);
+    await message.reply(`Manual override cleared — following the schedule. Right now auto-replies are **${state.active ? 'ON' : 'OFF'}** (${state.reason}).`);
+    console.log(`[Control] ${message.author.username} cleared override in ${message.guild.name}`);
+  } else {
+    const state = isBotActive(serverId);
+    const brandCtx = getBrandContext(serverId);
+    const oh = brandCtx.officeHours;
+    const lines = [
+      `Auto-replies: **${state.active ? 'ON' : 'OFF'}** — ${state.reason}`,
+      oh ? `Office hours: ${oh.start}–${oh.end} ${oh.timezone || 'Europe/London'} (days: ${(oh.days || [1, 2, 3, 4, 5]).join(', ')})` : 'Office hours: not configured — dashboard flag only',
+      'Commands: `!alice on` · `!alice off` · `!alice auto` · `!alice status`',
+      '_Note: manual overrides reset to auto if the bot restarts. Tracking, alerts, and scheduled posts run regardless._',
+    ];
+    await message.reply(lines.join('\n'));
+  }
   return true;
 }
 
@@ -1144,7 +1229,7 @@ ${isConversational ? conversationalRules : questionOnlyRules}`;
 
 function scheduleAutoReply(message) {
   const brandCtx = getBrandContext(message.guild.id);
-  if (!brandCtx.autoReplyEnabled) return;
+  if (!isBotActive(message.guild.id).active) return;
   if (!anthropic) return;
 
   // Don't reply in excluded channels
@@ -1171,6 +1256,9 @@ function scheduleAutoReply(message) {
 
   const timeoutId = setTimeout(async () => {
     pendingAutoReplies.delete(message.id);
+
+    // Re-check at fire time — the team may have come online or hit !alice off
+    if (!isBotActive(message.guild.id).active) return;
 
     // Check if already answered by team
     const serverPending = pendingMessages.get(message.guild.id);
@@ -1998,7 +2086,7 @@ async function catchUpUnanswered() {
 
   for (const [, guild] of client.guilds.cache) {
     const brandCtx = getBrandContext(guild.id);
-    if (!brandCtx.autoReplyEnabled) continue;
+    if (!isBotActive(guild.id).active) continue;
 
     const excludeChannels = brandCtx.excludeChannels || defaultBotConfig.excludeChannels || [];
 
@@ -2272,6 +2360,7 @@ client.on('messageCreate', async (message) => {
   if (await handleProxyCommand(message)) return;
   if (await handleStatusCommand(message)) return;
   if (await handleInspireCommand(message)) return;
+  if (await handleAliceCommand(message)) return;
 
   await trackMessage(message, isTeam);
 
