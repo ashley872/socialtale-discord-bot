@@ -123,6 +123,10 @@
     "conversational": true,
     "autoReplyDelayMinutes": 3,
     "maxRepliesPerHour": 30,
+    "quietHoursEnabled": true,
+    "quietHoursStart": 8,
+    "quietHoursEnd": 12,
+    "quietHoursTimezone": "Europe/Amsterdam",
     "brandVoice": "Friendly, knowledgeable, and community-driven. Alice is a helpful member of the Social Tale community — she's approachable, concise, and always willing to help. Never mentions being a bot or AI. Speaks like a real team member.",
     "context": [
       "Social Tale is a TikTok Shop agency that helps brands grow through creator-led commerce.",

@@ -84,6 +84,10 @@ async function loadBotConfigFromDB() {
         maxRepliesPerHour:     row.max_replies_per_hour,
         excludeChannels:       row.exclude_channels || [],
         confidenceThreshold:   row.confidence_threshold,
+        quietHoursEnabled:     row.quiet_hours_enabled ?? false,
+        quietHoursStart:       row.quiet_hours_start ?? 0,
+        quietHoursEnd:         row.quiet_hours_end ?? 0,
+        quietHoursTimezone:    row.quiet_hours_timezone ?? 'UTC',
       };
       // Only set conversational if DB explicitly has it; otherwise preserve static JSON value
       if (row.conversational !== undefined && row.conversational !== null) {
@@ -963,6 +967,22 @@ function scheduleAutoReply(message) {
     ).size;
     if (recentInChannel > 5 && Math.random() < 0.7) {
       console.log(`Skipping reply in busy #${message.channel.name} (${recentInChannel} msgs in 5min)`);
+      return;
+    }
+  }
+
+  // Quiet hours check — skip auto-reply if we're in the team's quiet window
+  const quietEnabled = brandCtx.quietHoursEnabled ?? defaultBotConfig.quietHoursEnabled ?? false;
+  if (quietEnabled) {
+    const tz = brandCtx.quietHoursTimezone || defaultBotConfig.quietHoursTimezone || 'UTC';
+    const hourInTz = parseInt(new Date().toLocaleString('en-US', { timeZone: tz, hour: 'numeric', hour12: false }));
+    const qStart = brandCtx.quietHoursStart ?? defaultBotConfig.quietHoursStart ?? 0;
+    const qEnd   = brandCtx.quietHoursEnd   ?? defaultBotConfig.quietHoursEnd   ?? 0;
+    const inQuiet = qStart < qEnd
+      ? hourInTz >= qStart && hourInTz < qEnd
+      : hourInTz >= qStart || hourInTz < qEnd; // overnight range e.g. 22–6
+    if (inQuiet) {
+      console.log(`Quiet hours (${qStart}:00–${qEnd}:00 ${tz}) — skipping auto-reply in #${message.channel.name}`);
       return;
     }
   }
