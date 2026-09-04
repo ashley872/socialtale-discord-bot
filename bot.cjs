@@ -1381,6 +1381,28 @@ const SPAM_WORD_PATTERNS = [
   /\b(wire transfer|western union|cash ?app.*send)\b/i,
 ];
 
+// Creator-poaching / referral recruitment spam — members recruiting the
+// community onto other UGC platforms or agencies (e.g. "Join trybe!!! paid to post")
+const RECRUITMENT_PATTERNS = [
+  /jointrybe\.com/i,                                        // known offender
+  /\b(get\s+)?paid\s+to\s+post\b/i,                          // "paid to post"
+  /\bcross.?post\b[\s\S]{0,60}\b(paid|earn|commission)\b[\s\S]{0,120}https?:\/\//i,
+  /\b(join|sign\s?up)\b[\s\S]{0,50}\b(referral|invite|ref)\s*(link|code)\b/i,
+  /https?:\/\/\S+\/r\/[A-Z0-9]{6,}\b/,                       // referral-code URLs like /r/BK6BGXFJ
+  /\bstart\s+earning\s+as\s+a\s+creator\b/i,
+  /\b(earn|make)\s+(money|commission|\$\d+)\b[\s\S]{0,80}https?:\/\//i,
+];
+
+// Domains that are always fine to share — skip the AI spam check for these
+const SAFE_LINK_DOMAINS = [
+  'tiktok.com', 'vt.tiktok.com', 'vm.tiktok.com',
+  'discord.com', 'cdn.discordapp.com', 'media.discordapp.net',
+  'youtube.com', 'youtu.be', 'instagram.com',
+  'amazon.com', 'amzn.to',
+  'socialtale.co',
+  'canva.com', 'docs.google.com', 'drive.google.com', 'loom.com',
+];
+
 function detectSpam(message) {
   const content = message.content || '';
   const authorId = message.author.id;
@@ -1403,6 +1425,15 @@ function detectSpam(message) {
     }
   }
 
+  // Check for creator-poaching / referral recruitment spam
+  for (const pattern of RECRUITMENT_PATTERNS) {
+    if (pattern.test(content)) {
+      trackSpamOffence(authorId, 'recruitment spam');
+      const tracker = spamTracker.get(authorId);
+      return { reason: `Recruitment/referral spam detected: ${pattern}`, kicked: tracker && tracker.count >= 2 };
+    }
+  }
+
   // Mass mentions (3+ user mentions in one message)
   const mentionCount = (content.match(/<@!?\d+>/g) || []).length;
   if (mentionCount >= 3) {
@@ -1422,6 +1453,54 @@ function detectSpam(message) {
   }
 
   return null; // not spam
+}
+
+// AI fallback — classify messages containing links the patterns didn't catch.
+// Only runs when the message has a URL outside SAFE_LINK_DOMAINS, so it costs
+// nothing for normal chat and TikTok/Amazon link sharing.
+async function aiSpamCheck(message) {
+  if (!anthropic) return null;
+  const content = message.content || '';
+  const urls = content.match(/https?:\/\/[^\s<>]+/gi) || [];
+  if (urls.length === 0) return null;
+
+  const unknownLinks = urls.filter(u => {
+    try {
+      const host = new URL(u).hostname.replace(/^www\./, '').toLowerCase();
+      return !SAFE_LINK_DOMAINS.some(d => host === d || host.endsWith('.' + d));
+    } catch { return true; }
+  });
+  if (unknownLinks.length === 0) return null;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 60,
+      messages: [{ role: 'user', content:
+`You moderate a brand's TikTok Shop creator community on Discord. Classify this member message.
+
+SPAM includes: recruiting members to other UGC platforms, agencies, or communities; referral/invite links; "paid to post" or "earn money" offers; crypto/investment schemes; adult content; phishing; unsolicited promotion of outside services.
+
+NOT spam: members sharing their own TikTok videos or shop links, product links, questions, wins, or normal conversation.
+
+Message:
+"""
+${content.substring(0, 500)}
+"""
+
+Reply with exactly "SPAM: <short reason>" or "OK".` }],
+    });
+    const verdict = response.content[0]?.text?.trim() || '';
+    if (verdict.startsWith('SPAM')) {
+      const authorId = message.author.id;
+      trackSpamOffence(authorId, 'ai-flagged link');
+      const tracker = spamTracker.get(authorId);
+      return { reason: verdict.replace(/^SPAM:?\s*/, 'AI flagged: '), kicked: tracker && tracker.count >= 2 };
+    }
+  } catch (err) {
+    console.error('[Spam] AI check error:', err.message);
+  }
+  return null;
 }
 
 function trackSpamOffence(authorId, reason) {
@@ -2329,7 +2408,8 @@ client.on('messageCreate', async (message) => {
 
   // ── Spam / bad actor detection ──
   if (!isTeam) {
-    const flagged = detectSpam(message);
+    let flagged = detectSpam(message);
+    if (!flagged) flagged = await aiSpamCheck(message); // AI fallback for unrecognised links
     if (flagged) {
       try {
         await message.delete();
