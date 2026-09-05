@@ -1503,6 +1503,40 @@ Reply with exactly "SPAM: <short reason>" or "OK".` }],
   return null;
 }
 
+// Warn a user whose message was removed — DM first, short-lived channel note
+// if their DMs are closed. Deduped so flooders don't get a warning per message.
+const spamWarnings = new Map(); // authorId → last warning timestamp
+
+async function warnSpamUser(message) {
+  const authorId = message.author.id;
+  const last = spamWarnings.get(authorId) || 0;
+  if (Date.now() - last < 60000) return; // already warned in the last minute
+  spamWarnings.set(authorId, Date.now());
+
+  const warningText =
+    `Hey ${message.author.username} 👋 Your message in **${message.guild.name}** ` +
+    `(#${message.channel.name}) was removed because it looked like spam or promotion ` +
+    `of an outside platform — that's not allowed in this community.\n\n` +
+    `If you think this was a mistake, reply to a team member in the server. ` +
+    `Please note: posting spam again will get you removed from the server.`;
+
+  try {
+    await message.author.send(warningText);
+    console.log(`[Spam] Warned ${message.author.username} via DM`);
+  } catch (_) {
+    // DMs closed — post a brief note in the channel and clean it up after 20s
+    try {
+      const note = await message.channel.send(
+        `<@${authorId}> your message was removed — spam/outside promotion isn't allowed here. A repeat will get you removed from the server.`
+      );
+      setTimeout(() => note.delete().catch(() => {}), 20000);
+      console.log(`[Spam] Warned ${message.author.username} in channel (DMs closed)`);
+    } catch (err) {
+      console.error(`[Spam] Could not warn ${message.author.username}: ${err.message}`);
+    }
+  }
+}
+
 function trackSpamOffence(authorId, reason) {
   const existing = spamTracker.get(authorId);
   if (existing) {
@@ -2414,11 +2448,15 @@ client.on('messageCreate', async (message) => {
       try {
         await message.delete();
         console.log(`[Spam] Deleted message from ${message.author.username} in #${message.channel.name}: ${flagged.reason}`);
+        // Warn the user (DM first, brief channel note if DMs are closed)
+        if (!flagged.kicked) {
+          await warnSpamUser(message);
+        }
         // Alert team via Slack
         await slackAlert(`:rotating_light: Spam detected in ${message.guild.name}`, [
           { type: 'section', text: { type: 'mrkdwn',
             text: `*#${message.channel.name}* — ${message.author.username}\n*Reason:* ${flagged.reason}\n*Content:* ${message.content?.substring(0, 300) || '(no text)'}` } },
-          { type: 'context', elements: [{ type: 'mrkdwn', text: flagged.kicked ? ':boot: User was kicked' : ':wastebasket: Message deleted — user not kicked (single offence)' }] },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: flagged.kicked ? ':boot: User was kicked' : ':wastebasket: Message deleted + user warned (first offence)' }] },
         ]);
         // Alert in Discord team channel
         const alertChannel = await getOrCreateAlertChannel(message.guild);
